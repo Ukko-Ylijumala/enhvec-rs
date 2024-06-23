@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+use crate::hashing::{CustomXxh3Hasher, Xxh3Hashable};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -199,6 +200,29 @@ impl<T: Ord> EnhVec<T> {
 
 /* --------------------------------- */
 
+impl<T> Deref for EnhVec<T> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for EnhVec<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T: PartialEq> EnhVec<T> {
+    /// Count the occurrences of a value.
+    pub fn count(&self, value: &T) -> usize {
+        self.iter().filter(|&x| x == value).count()
+    }
+}
+
+/* ################## Hashing and custom hashing behaviour ################# */
+
 impl<T: Ord + Hash> Hash for EnhVec<T> {
     /**
     The hash of a Vec is **not** the same as iterating over the elements
@@ -220,26 +244,21 @@ impl<T: Ord + Hash> Hash for EnhVec<T> {
     }
 }
 
-/* --------------------------------- */
-
-impl<T> Deref for EnhVec<T> {
-    type Target = Vec<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl<T: Ord + Xxh3Hashable> Xxh3Hashable for EnhVec<T> {
+    #[inline]
+    fn xxh3<H: Hasher>(&self, state: &mut H) {
+        self.as_sorted_asc()
+            .iter()
+            .for_each(|elem| elem.xxh3(state));
     }
-}
 
-impl<T> DerefMut for EnhVec<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<T: PartialEq> EnhVec<T> {
-    /// Count the occurrences of a value.
-    pub fn count(&self, value: &T) -> usize {
-        self.iter().filter(|&x| x == value).count()
+    #[inline]
+    fn xxh3_digest(&self) -> u64 {
+        let mut hasher: CustomXxh3Hasher = CustomXxh3Hasher::default();
+        self.as_sorted_asc()
+            .iter()
+            .for_each(|elem| elem.xxh3(&mut hasher));
+        hasher.finish()
     }
 }
 
