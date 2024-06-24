@@ -235,6 +235,13 @@ impl<T: Ord + Hash> Hash for EnhVec<T> {
     regardless of any other factors. This also means that we must always
     hash the elements in the same (sorted) order, AND that the hash algo
     must be stable (i.e. always produce the same hash for the same input).
+
+    Since the standard hasher is not stable, the output of this method
+    will not be the same across different runs of the program, and will
+    change each time the standard hasher's [std::hash::RandomState] changes.
+
+    To produce truly repeatable hashes, it is recommended to use the `xxh3()`
+    or `xxh3_digest()` methods instead, which use a stable hasher.
     */
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -245,6 +252,14 @@ impl<T: Ord + Hash> Hash for EnhVec<T> {
 }
 
 impl<T: Ord + Xxh3Hashable> Xxh3Hashable for EnhVec<T> {
+    /**
+    This method is used to hash the elements in a stable, repeatable way.
+    Internally it works just like the standard `hash()` method, ie. it
+    updates the state of the given hasher with each element in turn.
+
+    The element in question must implement the [Xxh3Hashable] trait and
+    actually hash itself using the `xxh3()` method of course.
+    */
     #[inline]
     fn xxh3<H: Hasher>(&self, state: &mut H) {
         self.as_sorted_asc()
@@ -252,6 +267,10 @@ impl<T: Ord + Xxh3Hashable> Xxh3Hashable for EnhVec<T> {
             .for_each(|elem| elem.xxh3(state));
     }
 
+    /**
+    This method is used to hash the elements in a stable, repeatable way.
+    In contrast to `xxh3()`, this method returns the final u64 hash value.
+    */
     #[inline]
     fn xxh3_digest(&self) -> u64 {
         let mut hasher: CustomXxh3Hasher = CustomXxh3Hasher::default();
