@@ -25,7 +25,7 @@ pub struct EnhVec<T>(Vec<T>);
 
 // Technically PartialEq and PartialOrd bounds are not needed for the
 // methods in this block, but we want to restrict the types allowed
-// in EhnVec to those that can be compared and sorted.
+// in EnhVec to those that can be compared and sorted.
 impl<T: PartialEq + PartialOrd> EnhVec<T> {
     pub fn new() -> Self {
         Self(Vec::<T>::new())
@@ -74,12 +74,12 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
     }
 
     /// Run a closure on each element.
-    pub fn for_each(&self, f: impl Fn(&T)) {
+    pub fn for_each(&self, f: impl FnMut(&T)) {
         self.0.iter().for_each(f)
     }
     /// Run a closure on each element if the predicate is true.
-    pub fn for_each_if(&self, f: impl Fn(&T), predicate: impl Fn(&T) -> bool) {
-        self.0.iter().for_each(|elem| {
+    pub fn for_each_if(&self, mut f: impl FnMut(&T), predicate: impl Fn(&T) -> bool) {
+        self.0.iter().for_each(|elem: &T| {
             if predicate(elem) {
                 f(elem)
             }
@@ -92,7 +92,7 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
     }
     /// Run a mutating closure for each element if the predicate is true.
     pub fn modify_each_if(&mut self, mut f: impl FnMut(&mut T), predicate: impl Fn(&T) -> bool) {
-        self.0.iter_mut().for_each(|elem| {
+        self.0.iter_mut().for_each(|elem: &mut T| {
             if predicate(elem) {
                 f(elem)
             }
@@ -221,6 +221,13 @@ impl<T: PartialEq> EnhVec<T> {
     }
 }
 
+impl<T: PartialEq> PartialEq for EnhVec<T> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
 /* ################## Hashing and custom hashing behaviour ################# */
 
 impl<T: Ord + Hash> Hash for EnhVec<T> {
@@ -319,7 +326,7 @@ where
             return None;
         }
 
-        let mut counts: HashMap<T, i32> = HashMap::new();
+        let mut counts: HashMap<T, u32> = HashMap::new();
         for &item in self.iter() {
             *counts.entry(item).or_insert(0) += 1;
         }
@@ -373,12 +380,16 @@ impl<T: Integer> EnhVec<T> {
         }
 
         let sum: i128 = self.iter().copied().sum::<T>().into();
-        Some((sum / self.len() as i128) as f64)
+        Some(sum as f64 / self.len() as f64)
     }
 
-    /// Return the product of all elements.
-    pub fn product(&self) -> T {
-        self.iter().fold(T::one(), |acc, &x| acc * x)
+    /// Return the product of all elements. For empty EnhVec, `product == 1`.
+    /// To avoid overflow, multiplications are performed as `i128`.
+    pub fn product(&self) -> i128
+    where
+        T: Into<i128>,
+    {
+        self.iter().fold(1, |acc: i128, &x| acc * x.into())
     }
 
     /// Return the variance of the elements.
@@ -404,7 +415,7 @@ impl<T: Integer> EnhVec<T> {
     where
         T: Into<i128>,
     {
-        self.variance().map(|v| v.sqrt())
+        self.variance().map(|v: f64| v.sqrt())
     }
 
     /// Return the percentile value of the elements. NOTE: `0.0 <=` [p] `<= 1.0`
@@ -430,7 +441,7 @@ impl<T: Float> EnhVec<T> {
         }
 
         let mut sorted: Vec<T> = self.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        sorted.sort_by(|a: &T, b: &T| a.partial_cmp(b).unwrap_or(Ordering::Equal));
         let mid: usize = sorted.len() / 2;
 
         if sorted.len() % 2 == 0 {
@@ -545,9 +556,37 @@ impl_big_integer!(u64, u128, usize, i64, i128);
 
 /* --------------------------------- */
 
-/// In contrast to [Integer], we must remove [Eq] and [Ord] constraints, as
-/// they are not defined for floating point numbers due to `NaN`. Also [Hash]
-/// is not implemented for f32/f64, so we must remove that constraint as well.
+/**
+In contrast to [Integer], we must remove [Eq] and [Ord] constraints, as
+they are not defined for floating point numbers due to `NaN`. Also [Hash]
+is not implemented for f32/f64, so we must remove that constraint as well.
+
+The `f32` and `f64` types are IEEE 754 floating point numbers, which are not
+exact representations of real numbers. Hence floating point arithmetic is not
+exact and can (will) lead to rounding errors. For example, `0.1 + 0.2` is very
+close to `0.3`, but not exactly equal to it. This is due to the fact that
+floating point numbers cannot be exactly represented in binary and the result
+is a number that is extremely close to `0.3`, but not quite.
+
+This difference is usually denoted as a (very small) number called the "machine
+epsilon" (`ε`), which is the smallest number that can be added to `1.0` to get a
+result different from `1.0`.
+
+## `f32`
+- range: ±3.40282 × 10^38
+- smallest normal: 1.17549 x 10^-38
+- smallest subnormal: 1.4 × 10^−45
+- precision: ~7 decimal digits (≈1.19 × 10^−7)
+## `f64`
+- range: ±1.79769 × 10^308
+- smallest normal: 2.22507 x 10^-308
+- smallest subnormal: 4.94 × 10^−324
+- precision: ~15-17 decimal digits (≈2.22 × 10^−16)
+### Both types can also represent:
+- Positive and negative zero (+0.0 and -0.0)
+- Positive and negative infinity
+- NaN (Not a Number)
+*/
 pub trait Float:
     Copy
     + Sum
@@ -638,5 +677,295 @@ where
             y = n / x;
         }
         x
+    }
+}
+
+/* ######################################################################### */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PI_LEN: usize = 16;
+    const PI_SUM: u32 = 80;
+    const PI_ARR: [u32; PI_LEN] = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3];
+    const PI_ASC: [u32; PI_LEN] = [1, 1, 2, 3, 3, 3, 4, 5, 5, 5, 6, 7, 8, 9, 9, 9];
+    const PI_DESC: [u32; PI_LEN] = [9, 9, 9, 8, 7, 6, 5, 5, 5, 4, 3, 3, 3, 2, 1, 1];
+    const FP_ARR: [f64; 7] = [-999.0, 1.0, 2.0, 3.0, 4.0, 5.0, 999.0];
+    const XTRA: u32 = 99;
+    const EPSILON: f64 = 1e-10;
+
+    #[test]
+    fn test_new_and_push() {
+        let mut ev1: EnhVec<u32> = EnhVec::new();
+        assert!(ev1.is_empty());
+        ev1.push(PI_ARR[0]);
+        ev1.push(PI_ARR[1]);
+        assert_eq!(ev1.len(), 2);
+        assert_eq!(ev1[0], PI_ARR[0]);
+        assert_eq!(ev1[1], PI_ARR[1]);
+
+        let ev2: EnhVec<u32> = EnhVec::new();
+        assert_ne!(ev1, ev2);
+    }
+
+    #[test]
+    fn test_from_iter() {
+        let ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        assert_eq!(ev.len(), PI_LEN);
+        assert_eq!(ev[0], PI_ARR[0]);
+        assert_eq!(ev[7], PI_ARR[7]);
+    }
+
+    #[test]
+    fn test_is_sorted() {
+        let t: Vec<i32> = vec![-1, 0, 1, 2, 3, 4, 5, 99];
+        let ev1: EnhVec<i32> = EnhVec::new_from(t.clone());
+        assert!(ev1.is_sorted());
+
+        let ev2: EnhVec<&i32> = EnhVec::from_iter(t.iter().rev());
+        assert!(!ev2.is_sorted());
+    }
+
+    #[test]
+    fn test_sort_asc_and_iter() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        ev.sort_asc();
+        assert_eq!(ev.len(), PI_LEN);
+
+        let test: Vec<u32> = Vec::from_iter(PI_ASC);
+        assert_eq!(ev.to_vec(), test);
+        ev.iter()
+            .enumerate()
+            .for_each(|(i, x)| assert_eq!(x, &test[i]));
+    }
+
+    #[test]
+    fn test_sort_desc_and_iter() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        ev.sort_desc();
+        assert_eq!(ev.len(), PI_LEN);
+
+        let test: Vec<u32> = Vec::from_iter(PI_DESC);
+        assert_eq!(ev.to_vec(), test);
+        ev.iter()
+            .enumerate()
+            .for_each(|(i, x)| assert_eq!(x, &test[i]));
+    }
+
+    #[test]
+    fn test_push_front() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        ev.push_front(XTRA);
+        assert_eq!(ev.len(), PI_LEN + 1);
+
+        let mut test: Vec<u32> = Vec::from_iter(PI_ARR);
+        test.insert(0, XTRA);
+        assert_eq!(ev.to_vec(), test);
+    }
+
+    #[test]
+    fn test_push_swap_front() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        ev.push_swap_front(XTRA);
+        assert_eq!(ev.len(), PI_LEN + 1);
+
+        let mut test: Vec<u32> = Vec::from_iter(PI_ARR);
+        test.push(XTRA);
+        test.swap(0, PI_LEN);
+        assert_eq!(ev.to_vec(), test);
+    }
+
+    #[test]
+    fn test_insert_sorted() {
+        let x: i32 = XTRA as i32;
+        let mut ev: EnhVec<i32> = EnhVec::from_iter(vec![-x, 1, 3, 5, x]);
+        assert_eq!(ev.len(), 5);
+        ev.insert_sorted(4);
+        assert_eq!(ev.len(), 6);
+        assert_eq!(ev.to_vec(), vec![-x, 1, 3, 4, 5, x]);
+    }
+
+    #[test]
+    fn test_as_ref_vec() {
+        let ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        let test: Vec<&u32> = vec![
+            &3, &1, &4, &1, &5, &9, &2, &6, &5, &3, &5, &8, &9, &7, &9, &3,
+        ];
+        assert_eq!(ev.as_ref_vec(), test);
+    }
+
+    #[test]
+    fn test_for_each() {
+        let ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+
+        let mut sum: u32 = 0;
+        ev.for_each(|x: &u32| sum += x);
+        assert_eq!(sum, PI_SUM, "sum of all digits");
+
+        let mut sum_if: u32 = 0;
+        ev.for_each_if(|x: &u32| sum_if += x, |x: &u32| x % 2 == 0);
+        assert_eq!(sum_if, 20, "sum of even digits");
+    }
+
+    #[test]
+    fn test_modify_each() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+
+        ev.modify_each(|x: &mut u32| *x += 1);
+        assert_eq!(ev.to_vec(), vec![4, 2, 5, 2, 6, 10, 3, 7, 6, 4, 6, 9, 10, 8, 10, 4]);
+
+        ev.modify_each_if(|x: &mut u32| *x -= 1, |x: &u32| x > &5);
+        assert_eq!(ev.to_vec(), vec![4, 2, 5, 2, 5, 9, 3, 6, 5, 4, 5, 8, 9, 7, 9, 4]);
+    }
+
+    #[test]
+    fn test_count() {
+        let ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        assert_eq!(ev.count(&0), 0);
+        assert_eq!(ev.count(&1), 2);
+        assert_eq!(ev.count(&2), 1);
+        assert_eq!(ev.count(&3), 3);
+        assert_eq!(ev.count(&4), 1);
+        assert_eq!(ev.count(&5), 3);
+        assert_eq!(ev.count(&6), 1);
+        assert_eq!(ev.count(&7), 1);
+        assert_eq!(ev.count(&8), 1);
+        assert_eq!(ev.count(&9), 3);
+        assert_eq!(ev.count(&XTRA), 0);
+    }
+
+    #[test]
+    fn test_sum() {
+        let ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        assert_eq!(ev.sum(), PI_SUM);
+    }
+
+    #[test]
+    fn test_range() {
+        let ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        assert_eq!(ev.range(), Some(8));
+    }
+
+    #[test]
+    fn test_median() {
+        let ev1: EnhVec<i32> = EnhVec::from_iter(vec![1, 3, 5]);
+        assert_eq!(ev1.median(), Some(3));
+
+        let ev2: EnhVec<i32> = EnhVec::from_iter(vec![1, 2, 3, 4]);
+        assert_eq!(ev2.median(), Some(2));
+    }
+
+    #[test]
+    fn test_mode() {
+        let ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        // 3, 5 and 9 have the same count
+        assert!(matches!(ev.mode(), Some(3) | Some(5) | Some(9)), "mode is not 3, 5 or 9");
+    }
+
+    #[test]
+    fn test_average() {
+        let ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        assert_eq!(ev.average(), Some(5.0));
+    }
+
+    #[test]
+    fn test_product() {
+        let ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        let mut prod: i128 = 1;
+        ev.for_each(|x: &u32| prod *= *x as i128);
+        assert_eq!(ev.product(), prod);
+    }
+
+    #[test]
+    fn test_variance_and_stdev() {
+        let ev: EnhVec<u32> = EnhVec::from_iter(vec![2, 4, 4, 4, 5, 5, 7, 9]);
+        let var_diff: f64 = ev.variance().unwrap() - 4.0;
+        let std_diff: f64 = ev.stdev().unwrap() - 2.0;
+        assert!(var_diff.abs() < EPSILON, "variance diff ({var_diff}) not within epsilon");
+        assert!(std_diff.abs() < EPSILON, "stdev diff ({std_diff}) not within epsilon");
+    }
+
+    #[test]
+    fn test_distinct() {
+        let x: i32 = XTRA as i32;
+        let ev: EnhVec<i32> = EnhVec::from_iter(vec![x, 1, 2, 2, -x, 3, 3, 3, 4]);
+        let distinct: EnhVec<i32> = ev.distinct(true);
+        assert_eq!(distinct.to_vec(), vec![-x, 1, 2, 3, 4, x]);
+    }
+
+    #[test]
+    fn test_percentile() {
+        let ev: EnhVec<u32> = EnhVec::from_iter(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, XTRA]);
+        assert_eq!(ev.percentile(0.00), Some(0), "percentile 0.0");
+        assert_eq!(ev.percentile(0.01), Some(0), "percentile 0.01");
+        assert_eq!(ev.percentile(0.10), Some(1), "percentile 0.1");
+        assert_eq!(ev.percentile(0.20), Some(2), "percentile 0.2");
+        assert_eq!(ev.percentile(0.30), Some(3), "percentile 0.3");
+        assert_eq!(ev.percentile(0.40), Some(4), "percentile 0.4");
+        assert_eq!(ev.percentile(0.50), Some(5), "percentile 0.5");
+        assert_eq!(ev.percentile(0.54), Some(5), "percentile 0.54");
+        assert_eq!(ev.percentile(0.55), Some(6), "percentile 0.55");
+        assert_eq!(ev.percentile(0.60), Some(6), "percentile 0.6");
+        assert_eq!(ev.percentile(0.70), Some(7), "percentile 0.7");
+        assert_eq!(ev.percentile(0.80), Some(8), "percentile 0.8");
+        assert_eq!(ev.percentile(0.90), Some(9), "percentile 0.9");
+        assert_eq!(ev.percentile(0.95), Some(XTRA), "percentile 0.95");
+        assert_eq!(ev.percentile(1.00), Some(XTRA), "percentile 1.0");
+    }
+
+    #[test]
+    fn test_median_fp() {
+        let ev: EnhVec<f64> = EnhVec::from_iter(FP_ARR);
+        let diff: f64 = ev.median_fp().unwrap() - 3.0;
+        assert!(diff.abs() < EPSILON, "median diff ({diff}) not within epsilon");
+    }
+
+    #[test]
+    fn test_average_fp() {
+        let ev: EnhVec<f32> = EnhVec::from_iter(FP_ARR.iter().map(|&x| x as f32));
+        let diff: f32 = ev.average_fp().unwrap() - 2.142857143; // 15 / 7
+        assert!(diff.abs() < EPSILON as f32, "avg diff ({diff}) not within epsilon");
+    }
+
+    #[test]
+    fn test_product_fp() {
+        let ev: EnhVec<f64> = EnhVec::from_iter(FP_ARR);
+        let mut prod: f64 = 1.0;
+        ev.for_each(|x: &f64| prod *= x);
+        let diff: f64 = ev.product_fp() - prod;
+        assert!(diff.abs() < EPSILON, "product diff ({diff}) not within epsilon");
+    }
+
+    #[test]
+    fn test_empty_vec() {
+        let ev: EnhVec<i32> = EnhVec::new();
+        assert!(ev.is_empty());
+        assert_eq!(ev.sum(), 0, "sum is not zero");
+        assert_eq!(ev.product(), 1, "product is not one");
+        assert_eq!(ev.range(), None, "range is not None");
+        assert_eq!(ev.median(), None, "median is not None");
+        assert_eq!(ev.mode(), None, "mode is not None");
+        assert_eq!(ev.average(), None, "average is not None");
+        assert_eq!(ev.percentile(-1.), None, "percentile < 0 is not None");
+        assert_eq!(ev.percentile(0.5), None, "percentile is not None");
+        assert_eq!(ev.percentile(1.5), None, "percentile > 1 is not None");
+        assert!(ev.is_sorted(), "is_sorted");
+    }
+
+    #[test]
+    fn test_single_element() {
+        let purpose: i32 = 42;
+        let ev: EnhVec<i32> = EnhVec::from_iter(vec![purpose]);
+        assert_eq!(ev.sum(), purpose, "sum");
+        assert_eq!(ev.product(), purpose.into(), "product");
+        assert_eq!(ev.range(), Some(0), "range");
+        assert_eq!(ev.median(), Some(purpose), "median");
+        assert_eq!(ev.mode(), Some(purpose), "mode");
+        assert_eq!(ev.average(), Some(purpose as f64), "average");
+        assert_eq!(ev.percentile(0.01), Some(purpose), "percentile 0.01");
+        assert_eq!(ev.percentile(0.50), Some(purpose), "percentile 0.50");
+        assert_eq!(ev.percentile(0.99), Some(purpose), "percentile 0.99");
+        assert!(ev.is_sorted(), "is_sorted");
     }
 }
