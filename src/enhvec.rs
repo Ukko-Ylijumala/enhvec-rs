@@ -1,6 +1,4 @@
-// Copyright (c) 2024 Mikko Tanner. All rights reserved.
-
-#![allow(dead_code)]
+// Copyright (c) 2024-2025 Mikko Tanner. All rights reserved.
 
 use crate::hashing::{CustomXxh3Hasher, Xxh3Hashable};
 use std::{
@@ -10,6 +8,26 @@ use std::{
     iter::Sum,
     ops::{Add, Deref, DerefMut, Div, Mul, Sub},
 };
+
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+/// The expected sorting state of an [EnhVec].
+pub enum Sorting {
+    #[default]
+    None,
+    Ascending,
+    Descending,
+}
+
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+/// The current sorting state of an [EnhVec].
+enum SortState {
+    #[default]
+    Unsorted,
+    Asc,
+    Desc,
+    Changed, // changed - could be sorted or not, depending on what happened
+    SwappedToFront(usize, Box<SortState>), // push_swap_front() was used N times
+}
 
 /**
 A wrapper around a Vec of elements (objects/items).
@@ -21,20 +39,61 @@ This struct provides additional methods for handling elements:
 - hashing the elements in a stable, repeatable way
 */
 #[derive(Debug, Default, Clone)]
-pub struct EnhVec<T>(Vec<T>);
+pub struct EnhVec<T> {
+    v: Vec<T>,
+    sort: Sorting,
+    state: SortState,
+}
 
 // Technically PartialEq and PartialOrd bounds are not needed for the
 // methods in this block, but we want to restrict the types allowed
 // in EnhVec to those that can be compared and sorted.
 impl<T: PartialEq + PartialOrd> EnhVec<T> {
+    fn default() -> Self {
+        Self {
+            v: Vec::<T>::new(),
+            sort: Sorting::None,
+            state: SortState::Unsorted,
+        }
+    }
     pub fn new() -> Self {
-        Self(Vec::<T>::new())
+        Self::default()
+    }
+    pub fn new_sorted(sorting: Sorting) -> Self {
+        Self {
+            sort: sorting,
+            ..Self::default()
+        }
+    }
+    pub fn new_with_capacity(capacity: usize) -> Self {
+        Self {
+            v: Vec::<T>::with_capacity(capacity),
+            ..Self::default()
+        }
     }
     pub fn new_from(elements: Vec<T>) -> Self {
-        Self(elements)
+        Self {
+            v: elements,
+            ..Self::default()
+        }
     }
     pub fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        Self(iter.into_iter().collect())
+        Self {
+            v: iter.into_iter().collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Insert an element at index. Possibly slow, as it may shift other elements.
+    pub fn insert(&mut self, idx: usize, element: T) {
+        self.v.insert(idx, element);
+        self.state = SortState::Changed;
+    }
+
+    /// Push an element to the end of the [EnhVec].
+    pub fn push(&mut self, element: T) {
+        self.v.push(element);
+        self.state = SortState::Changed;
     }
 
     /**
@@ -47,7 +106,7 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
     first one and don't particularly care about the rest.
     */
     pub fn push_front(&mut self, element: T) {
-        self.0.insert(0, element)
+        self.insert(0, element);
     }
 
     /**
@@ -58,28 +117,60 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
     */
     pub fn push_swap_front(&mut self, element: T) {
         let last: usize = self.len(); // len() - 1 after push()
-        self.push(element);
+        self.v.push(element);
         if last > 0 {
             self.swap(0, last);
+        }
+
+        match &self.state {
+            SortState::Asc | SortState::Desc => {
+                self.state = SortState::SwappedToFront(1, Box::new(self.state.clone()));
+            }
+            SortState::SwappedToFront(num, prevstate) => {
+                self.state = SortState::SwappedToFront(num + 1, prevstate.clone());
+            }
+            _ => {
+                self.state = SortState::Changed;
+            }
+        }
+    }
+
+    /// Reverse the order of the elements in place. [SortState] and [Sorting] are updated.
+    pub fn reverse(&mut self) {
+        self.v.reverse();
+        match self.state {
+            SortState::Changed | SortState::Unsorted | SortState::SwappedToFront(_, _) => {
+                self.state = SortState::Changed;
+                self.sort = Sorting::None;
+            }
+            SortState::Asc => {
+                self.state = SortState::Desc;
+                self.sort = Sorting::Descending;
+            }
+            SortState::Desc => {
+                self.state = SortState::Asc;
+                self.sort = Sorting::Ascending;
+            }
         }
     }
 
     /// Return a [Vec] of references to entries.
     pub fn as_ref_vec(&self) -> Vec<&T> {
-        self.0.iter().collect()
+        self.v.iter().collect()
     }
     /// Return a [Vec] of mutable references to entries.
     pub fn as_mut_ref_vec(&mut self) -> Vec<&mut T> {
-        self.0.iter_mut().collect()
+        self.state = SortState::Changed; // sort state could change
+        self.v.iter_mut().collect()
     }
 
     /// Run a closure on each element.
     pub fn for_each(&self, f: impl FnMut(&T)) {
-        self.0.iter().for_each(f)
+        self.v.iter().for_each(f)
     }
     /// Run a closure on each element if the predicate is true.
     pub fn for_each_if(&self, mut f: impl FnMut(&T), predicate: impl Fn(&T) -> bool) {
-        self.0.iter().for_each(|elem: &T| {
+        self.v.iter().for_each(|elem: &T| {
             if predicate(elem) {
                 f(elem)
             }
@@ -88,11 +179,13 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
 
     /// Run a mutating closure for each element.
     pub fn modify_each(&mut self, f: impl FnMut(&mut T)) {
-        self.0.iter_mut().for_each(f)
+        self.state = SortState::Changed;
+        self.v.iter_mut().for_each(f)
     }
     /// Run a mutating closure for each element if the predicate is true.
     pub fn modify_each_if(&mut self, mut f: impl FnMut(&mut T), predicate: impl Fn(&T) -> bool) {
-        self.0.iter_mut().for_each(|elem: &mut T| {
+        self.state = SortState::Changed;
+        self.v.iter_mut().for_each(|elem: &mut T| {
             if predicate(elem) {
                 f(elem)
             }
@@ -104,11 +197,11 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
     where
         T: Clone,
     {
-        self.0.clone()
+        self.v.clone()
     }
     /// Consume the [EnhVec] and return the inner [Vec<T>].
     pub fn into_vec(self) -> Vec<T> {
-        self.0
+        self.v
     }
 }
 
@@ -126,18 +219,22 @@ impl<T: Ord> EnhVec<T> {
             2 => return self[0] <= self[1],
             _ => {}
         }
+        if self.state == SortState::Asc {
+            // short circuit if already sorted
+            return true;
+        }
         if (self.first().unwrap()).gt(&self.last().unwrap()) {
             // short circuit if first > last
             return false;
         }
-        self.0
+        self.v
             .iter()
-            .zip(self.0.iter().skip(1))
+            .zip(self.v.iter().skip(1))
             .all(|(a, b)| a <= b)
 
         // TODO: check if this is faster than the iter().skip(1)
         // above for large Vecs and optimize accordingly
-        //     self.0.windows(2).all(|w| w[0] <= w[1])
+        //     self.v.windows(2).all(|w| w[0] <= w[1])
     }
 
     /**
@@ -147,7 +244,7 @@ impl<T: Ord> EnhVec<T> {
     If the Vec is not sorted, the insertion point would be more or less
     random, hence in this case we just `push()` the element to the end.
 
-    NOTE: this method is potentially slow, as it traverses the Vec 2 times:
+    NOTE: this method is potentially slow, as it might traverse the Vec 2 times:
     once to check if it is sorted (worst case: `O(N)`), and once to find the
     insertion point (`O(log n)`). This may be be optimized in the future.
 
@@ -157,43 +254,46 @@ impl<T: Ord> EnhVec<T> {
     pub fn insert_sorted(&mut self, element: T) {
         if self.is_empty() || element >= *self.last().unwrap() || !self.is_sorted() {
             // short circuit some common cases
-            self.push(element);
+            self.v.push(element);
             return;
         }
 
         let cutoff: usize = 20;
-        if self.len() < cutoff {
+        let idx: usize = match self.len() < cutoff {
             // linear search for "small" vectors
-            let idx: usize = self.iter().position(|x| element < *x).unwrap_or(self.len());
-            self.insert(idx, element);
-        } else {
+            true => self.iter().position(|x: &T| element < *x).unwrap_or(self.len()),
             // binary search for larger vectors
-            let idx: usize = match self.binary_search(&element) {
+            false => match self.binary_search(&element) {
                 Ok(index) | Err(index) => index,
-            };
-            self.insert(idx, element);
-        }
+            },
+        };
+        self.v.insert(idx, element);
     }
 
-    /// Normal sort: ascending order.
-    pub fn sort_asc(&mut self) {
-        self.0.sort()
-    }
-    /// Reverse sort: descending order.
-    pub fn sort_desc(&mut self) {
-        self.0.sort_by(|a, b| b.cmp(a))
+    /// Set the default sorting state of the [EnhVec] and sort the data.
+    pub fn sort(&mut self, sorting: Sorting) {
+        if sorting == self.sort {
+            return;
+        }
+        sort_vec(&mut self.v, &self.state, sorting);
+        self.sort = sorting;
+        match sorting {
+            Sorting::Ascending => self.state = SortState::Asc,
+            Sorting::Descending => self.state = SortState::Desc,
+            _ => self.state = SortState::Unsorted,
+        }
     }
 
     /// Return references to entries in ASCending order.
     pub fn as_sorted_asc(&self) -> Vec<&T> {
         let mut vec: Vec<&T> = self.as_ref_vec();
-        vec.sort();
+        sort_vec(&mut vec, &self.state, Sorting::Ascending);
         vec
     }
     /// Return references to entries in DESCending order.
     pub fn as_sorted_desc(&self) -> Vec<&T> {
         let mut vec: Vec<&T> = self.as_ref_vec();
-        vec.sort_by(|a, b| b.cmp(a));
+        sort_vec(&mut vec, &self.state, Sorting::Descending);
         vec
     }
 }
@@ -204,13 +304,13 @@ impl<T> Deref for EnhVec<T> {
     type Target = Vec<T>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.v
     }
 }
 
 impl<T> DerefMut for EnhVec<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.v
     }
 }
 
@@ -222,9 +322,8 @@ impl<T: PartialEq> EnhVec<T> {
 }
 
 impl<T: PartialEq> PartialEq for EnhVec<T> {
-    #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+        self.v == other.v
     }
 }
 
@@ -338,14 +437,14 @@ where
     }
 
     /// Return the distinct (unique) elements, optionally sorted.
-    pub fn distinct(&self, sorted: bool) -> EnhVec<T>
+    pub fn distinct(&self, sorted: Option<Sorting>) -> EnhVec<T>
     where
         T: Copy + Eq + Hash + Ord,
     {
         let set: HashSet<T> = self.iter().copied().collect();
         let mut result: EnhVec<T> = EnhVec::from_iter(set.into_iter());
-        if sorted {
-            result.sort_asc();
+        if sorted.is_some() {
+            result.sort(sorted.unwrap());
         }
         result
     }
@@ -628,55 +727,39 @@ impl_float!(f32, f64);
 
 /* ########################### Utility functions ########################### */
 
-/// Calculate the power of a number using the exponentiation by squaring method.
-#[inline]
-pub fn powi<T>(b: T, n: i64) -> f64
-where
-    T: Into<f64>,
-{
-    let b: f64 = b.into();
-    if n == 0 {
-        return 1.0;
+/// Sort a vector in place, based on the current and desired sorting state.
+fn sort_vec<T: Ord>(v: &mut Vec<T>, state: &SortState, desired: Sorting) {
+    // short circuit no-ops
+    let len: usize = v.len();
+    if len == 0 || len == 1 || desired == Sorting::None {
+        return;
+    } else if state == &SortState::Asc && desired == Sorting::Ascending {
+        return;
+    } else if state == &SortState::Desc && desired == Sorting::Descending {
+        return;
     }
-    let mut result: f64 = 1.0;
-    let mut base: f64 = b;
-    let mut exp: i64 = n.abs();
 
-    while exp > 0 {
-        if exp % 2 == 1 {
-            result *= base;
+    match state {
+        SortState::Changed | SortState::Unsorted => {
+            if desired == Sorting::Ascending {
+                v.sort();
+            } else {
+                v.sort_by(|a, b| b.cmp(a));
+            }
         }
-        exp /= 2;
-        base *= base;
-    }
-
-    if n < 0 {
-        1.0 / result
-    } else {
-        result
-    }
-}
-
-/// Calculate the square root of a number using the Babylonian method.
-#[inline]
-pub fn sqrt<T>(n: T) -> f64
-where
-    T: Into<f64>,
-{
-    let n: f64 = n.into();
-    if n < 0.0 {
-        f64::NAN
-    } else if n == 0.0 {
-        0.0
-    } else {
-        let mut x: f64 = n;
-        let mut y: f64 = 1.0;
-        let e: f64 = 0.00000001; // precision
-        while (x - y).abs() > e {
-            x = (x + y) / 2.0;
-            y = n / x;
+        SortState::Asc | SortState::Desc => {
+            v.reverse();
         }
-        x
+        SortState::SwappedToFront(num, prevstate) => {
+            if **prevstate == SortState::Asc || **prevstate == SortState::Desc {
+                // Restore the original 1st element back to the front.
+                // Since the vec used to be sorted, this should make the
+                // actual sorting algo's work a little easier.
+                v.swap(0, len - *num);
+            }
+            // recurse back to this function
+            sort_vec(v, &SortState::Changed, desired);
+        }
     }
 }
 
@@ -730,7 +813,7 @@ mod tests {
     #[test]
     fn test_sort_asc_and_iter() {
         let mut ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
-        ev.sort_asc();
+        ev.sort(Sorting::Ascending);
         assert_eq!(ev.len(), PI_LEN);
 
         let test: Vec<u32> = Vec::from_iter(PI_ASC);
@@ -743,7 +826,7 @@ mod tests {
     #[test]
     fn test_sort_desc_and_iter() {
         let mut ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
-        ev.sort_desc();
+        ev.sort(Sorting::Descending);
         assert_eq!(ev.len(), PI_LEN);
 
         let test: Vec<u32> = Vec::from_iter(PI_DESC);
@@ -889,8 +972,9 @@ mod tests {
     #[test]
     fn test_distinct() {
         let x: i32 = XTRA as i32;
-        let ev: EnhVec<i32> = EnhVec::from_iter(vec![x, 1, 2, 2, -x, 3, 3, 3, 4]);
-        let distinct: EnhVec<i32> = ev.distinct(true);
+        let data: Vec<i32> = vec![x, 1, 2, 2, -x, 3, 3, 3, 4];
+        let ev: EnhVec<i32> = EnhVec::from_iter(data);
+        let distinct: EnhVec<i32> = ev.distinct(Some(Sorting::Ascending));
         assert_eq!(distinct.to_vec(), vec![-x, 1, 2, 3, 4, x]);
     }
 
