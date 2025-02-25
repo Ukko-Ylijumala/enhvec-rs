@@ -1,6 +1,6 @@
 // Copyright (c) 2024-2025 Mikko Tanner. All rights reserved.
 
-use crate::hashing::{CustomXxh3Hasher, Xxh3Hashable};
+use custom_xxh3::{CustomXxh3Hasher, Xxh3Hashable};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
