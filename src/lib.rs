@@ -9,6 +9,9 @@ use std::{
     ops::{Add, Deref, DerefMut, Div, Mul, Sub},
 };
 
+/// The default size cutoff for sorting small vectors.
+const SORT_SIZE_CUTOFF: usize = 20;
+
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 /// The expected sorting state of an [EnhVec].
 pub enum Sorting {
@@ -258,8 +261,8 @@ impl<T: Ord> EnhVec<T> {
             return;
         }
 
-        let cutoff: usize = 20;
-        let idx: usize = match self.len() < cutoff {
+        // determine the insertion point
+        let idx: usize = match self.len() < SORT_SIZE_CUTOFF {
             // linear search for "small" vectors
             true => self.iter().position(|x: &T| element < *x).unwrap_or(self.len()),
             // binary search for larger vectors
@@ -310,6 +313,9 @@ impl<T> Deref for EnhVec<T> {
 
 impl<T> DerefMut for EnhVec<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // since we cannot (easily) control whether the inner Vec is modified
+        // through direct access, we must assume the worst and mark it as such
+        self.state = SortState::Changed;
         &mut self.v
     }
 }
@@ -747,9 +753,14 @@ fn sort_vec<T: Ord>(v: &mut Vec<T>, state: &SortState, desired: Sorting) {
                 v.sort_by(|a, b| b.cmp(a));
             }
         }
+
         SortState::Asc | SortState::Desc => {
+            // we already know the vec is sorted, but not in the desired order
+            // (because we checked for that in the short circuit above),
+            // so we can just reverse it to get the other order
             v.reverse();
         }
+
         SortState::SwappedToFront(num, prevstate) => {
             if **prevstate == SortState::Asc || **prevstate == SortState::Desc {
                 // Restore the original 1st element back to the front.
@@ -872,9 +883,7 @@ mod tests {
     #[test]
     fn test_as_ref_vec() {
         let ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
-        let test: Vec<&u32> = vec![
-            &3, &1, &4, &1, &5, &9, &2, &6, &5, &3, &5, &8, &9, &7, &9, &3,
-        ];
+        let test: Vec<&u32> = PI_ARR.iter().collect();
         assert_eq!(ev.as_ref_vec(), test);
     }
 
