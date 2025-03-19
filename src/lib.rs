@@ -498,6 +498,12 @@ impl<T> IndexMut<usize> for EnhVec<T> {
     }
 }
 
+impl<T: PartialEq + PartialOrd> From<Vec<T>> for EnhVec<T> {
+    fn from(v: Vec<T>) -> Self {
+        Self::new_from(v)
+    }
+}
+
 /* ################## Hashing and custom hashing behaviour ################# */
 
 impl<T: Ord + Hash> Hash for EnhVec<T> {
