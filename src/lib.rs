@@ -294,8 +294,15 @@ impl<T> EnhVec<T> {
         if k == 0 {
             return;
         }
-        self.v.extend(self.head.drain(..).rev());
-        self.v.rotate_right(k);
+        match self.state {
+            SortState::Asc => {
+                self.v.extend(self.head.drain(..).rev());
+                self.v.rotate_right(k);
+            }
+            _ => {
+                self.v.append(&mut self.head);
+            }
+        }
     }
 }
 
