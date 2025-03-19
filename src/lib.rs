@@ -31,7 +31,6 @@ enum SortState {
     Asc,
     Desc,
     Changed, // changed - could be sorted or not, depending on what happened
-    SwappedToFront(usize, Box<SortState>), // push_swap_front() was used N times
 }
 
 /**
@@ -134,10 +133,7 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
 
         match &self.state {
             SortState::Asc | SortState::Desc => {
-                self.state = SortState::SwappedToFront(1, Box::new(self.state.clone()));
-            }
-            SortState::SwappedToFront(num, prevstate) => {
-                self.state = SortState::SwappedToFront(num + 1, prevstate.clone());
+                self.state = SortState::Changed;
             }
             _ => {
                 self.state = SortState::Changed;
@@ -155,7 +151,7 @@ impl<T> EnhVec<T> {
         self.compact();
         self.v.reverse();
         match self.state {
-            SortState::Changed | SortState::Unsorted | SortState::SwappedToFront(_, _) => {
+            SortState::Changed | SortState::Unsorted => {
                 self.state = SortState::Changed;
                 self.sort = Sorting::None;
             }
@@ -854,17 +850,6 @@ fn sort_vec<T: Ord>(v: &mut Vec<T>, state: &SortState, desired: Sorting) {
             // (because we checked for that in the short circuit above),
             // so we can just reverse it to get the other order
             v.reverse();
-        }
-
-        SortState::SwappedToFront(num, prevstate) => {
-            if **prevstate == SortState::Asc || **prevstate == SortState::Desc {
-                // Restore the original 1st element back to the front.
-                // Since the vec used to be sorted, this should make the
-                // actual sorting algo's work a little easier.
-                v.swap(0, len - *num);
-            }
-            // recurse back to this function
-            sort_vec(v, &SortState::Changed, desired);
         }
     }
 }
