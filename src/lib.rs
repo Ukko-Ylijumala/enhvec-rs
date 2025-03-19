@@ -407,6 +407,62 @@ impl<T: PartialEq> EnhVec<T> {
     pub fn count(&self, value: &T) -> usize {
         self.internal_iter().filter(|&x| x == value).count()
     }
+
+    /// Check if the [EnhVec] contains a value.
+    pub fn contains(&self, value: &T) -> bool {
+        self.internal_iter().any(|x: &T| x == value)
+    }
+    /// Check if the [EnhVec] contains all values in another [EnhVec].
+    pub fn contains_all(&self, other: &Self) -> bool {
+        other.internal_iter().all(|x: &T| self.contains(x))
+    }
+    /// Check if the [EnhVec] contains any values in another [EnhVec].
+    pub fn contains_any(&self, other: &Self) -> bool {
+        other.internal_iter().any(|x: &T| self.contains(x))
+    }
+    /// Check if the [EnhVec] contains only values in another [EnhVec].
+    pub fn contains_only(&self, other: &Self) -> bool {
+        self.contains_all(other) && self.len() == other.len()
+    }
+
+    /// Check if the [EnhVec] is a subset of another [EnhVec].
+    pub fn is_subset(&self, other: &Self) -> bool {
+        self.contains_all(other)
+    }
+    /// Check if the [EnhVec] is a superset of another [EnhVec].
+    pub fn is_superset(&self, other: &Self) -> bool {
+        self.contains_any(other)
+    }
+    /// Check if the [EnhVec] is disjoint with another [EnhVec].
+    pub fn is_disjoint(&self, other: &Self) -> bool {
+        !self.contains_any(other)
+    }
+    /// Check if the [EnhVec] is equal to another [EnhVec].
+    pub fn is_equal(&self, other: &Self) -> bool {
+        self.contains_only(other)
+    }
+
+    /// Check if the [EnhVec] is a proper subset of another [EnhVec].
+    pub fn is_proper_subset(&self, other: &Self) -> bool {
+        self.is_subset(other) && self.len() < other.len()
+    }
+
+    /// Check if the [EnhVec] is a proper superset of another [EnhVec].
+    pub fn is_proper_superset(&self, other: &Self) -> bool {
+        self.is_superset(other) && self.len() > other.len()
+    }
+    /// Check if the [EnhVec] is a proper subset or superset of another [EnhVec].
+    pub fn is_proper(&self, other: &Self) -> bool {
+        self.is_proper_subset(other) || self.is_proper_superset(other)
+    }
+    /// Check if the [EnhVec] is a proper subset and superset of another [EnhVec].
+    pub fn is_proper_both(&self, other: &Self) -> bool {
+        self.is_proper_subset(other) && self.is_proper_superset(other)
+    }
+    /// Check if the [EnhVec] is a proper subset or superset of another [EnhVec].
+    pub fn is_proper_either(&self, other: &Self) -> bool {
+        self.is_proper_subset(other) || self.is_proper_superset(other)
+    }
 }
 
 impl<T: PartialEq> PartialEq for EnhVec<T> {
