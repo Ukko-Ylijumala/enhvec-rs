@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     iter::{Chain, Rev, Sum},
-    ops::{Add, Deref, DerefMut, Div, Mul, Sub},
+    ops::{Add, Div, Index, IndexMut, Mul, Sub},
     slice::{Iter, IterMut},
 };
 
@@ -125,10 +125,10 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
     all other elements. Time complexity: `O(1)`.
     */
     pub fn push_swap_front(&mut self, element: T) {
-        let last: usize = self.len(); // len() - 1 after push()
+        let last: usize = self.v.len(); // len() - 1 after push()
         self.v.push(element);
         if last > 0 {
-            self.swap(0, last);
+            self.v.swap(0, last);
         }
 
         match &self.state {
@@ -234,9 +234,18 @@ impl<T> EnhVec<T> {
     pub fn first(&self) -> Option<&T> {
         self.head.last().or_else(|| self.v.first())
     }
+    pub fn last(&self) -> Option<&T> {
+        self.v.last().or_else(|| self.head.first())
+    }
 
     pub fn pop(&mut self) -> Option<T> {
-        self.v.pop()
+        self.v.pop().or_else(|| {
+            if self.head.is_empty() {
+                None
+            } else {
+                Some(self.head.remove(0))
+            }
+        })
     }
 
     pub fn pop_front(&mut self) -> Option<T> {
@@ -300,17 +309,17 @@ impl<T: Ord> EnhVec<T> {
     NOTE: an empty or 1-element EnhVec is considered sorted.
     */
     pub fn is_sorted(&self) -> bool {
-        match self.len() {
+        match self.v.len() {
             // must check for empty first to avoid panic with `windows()` method
             0 | 1 => return true,
-            2 => return self[0] <= self[1],
+            2 => return self.v[0] <= self.v[1],
             _ => {}
         }
         if self.state == SortState::Asc {
             // short circuit if already sorted
             return true;
         }
-        if (self.first().unwrap()).gt(&self.last().unwrap()) {
+        if (self.first().unwrap()).gt(&self.v.last().unwrap()) {
             // short circuit if first > last
             return false;
         }
@@ -339,7 +348,7 @@ impl<T: Ord> EnhVec<T> {
     the Vec after all the insertions are done, as sorting is approx. `O(N log N)`.
     */
     pub fn insert_sorted(&mut self, element: T) {
-        if self.is_empty() || element >= *self.last().unwrap() || !self.is_sorted() {
+        if self.is_empty() || element >= *self.v.last().unwrap() || !self.is_sorted() {
             // short circuit some common cases
             self.v.push(element);
             return;
@@ -347,14 +356,14 @@ impl<T: Ord> EnhVec<T> {
 
         // determine the insertion point
         self.compact();
-        let idx: usize = match self.len() < SORT_SIZE_CUTOFF {
+        let idx: usize = match self.v.len() < SORT_SIZE_CUTOFF {
             // linear search for "small" vectors
             true => self
                 .internal_iter()
                 .position(|x: &T| element < *x)
-                .unwrap_or(self.len()),
+                .unwrap_or(self.v.len()),
             // binary search for larger vectors
-            false => match self.binary_search(&element) {
+            false => match self.v.binary_search(&element) {
                 Ok(index) | Err(index) => index,
             },
         };
@@ -393,24 +402,6 @@ impl<T: Ord> EnhVec<T> {
 
 /* --------------------------------- */
 
-impl<T> Deref for EnhVec<T> {
-    type Target = Vec<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.v
-    }
-}
-
-impl<T> DerefMut for EnhVec<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // since we cannot (easily) control whether the inner Vec is modified
-        // through direct access, we must assume the worst and mark it as such
-        self.state = SortState::Changed;
-        self.compact();
-        &mut self.v
-    }
-}
-
 impl<T: PartialEq> EnhVec<T> {
     /// Count the occurrences of a value.
     pub fn count(&self, value: &T) -> usize {
@@ -421,6 +412,33 @@ impl<T: PartialEq> EnhVec<T> {
 impl<T: PartialEq> PartialEq for EnhVec<T> {
     fn eq(&self, other: &Self) -> bool {
         self.head == other.head && self.v == other.v
+    }
+}
+
+// Allow indexing into EnhVec
+impl<T> Index<usize> for EnhVec<T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        let head_len: usize = self.head.len();
+        if index < head_len {
+            // head elements are in reverse order -> reverse the index
+            &self.head[head_len - 1 - index]
+        } else {
+            &self.v[index - head_len]
+        }
+    }
+}
+
+// Allow mutable indexing into EnhVec
+impl<T> IndexMut<usize> for EnhVec<T> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        let head_len: usize = self.head.len();
+        if index < head_len {
+            &mut self.head[head_len - 1 - index]
+        } else {
+            &mut self.v[index - head_len]
+        }
     }
 }
 
