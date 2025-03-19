@@ -24,7 +24,7 @@ pub enum Sorting {
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
-/// The current sorting state of an [EnhVec].
+/// The current (internal) sorting state of an [EnhVec].
 enum SortState {
     #[default]
     Unsorted,
@@ -93,13 +93,13 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
     /// Insert an element at index. Possibly slow, as it may shift other elements.
     pub fn insert(&mut self, idx: usize, element: T) {
         self.v.insert(idx, element);
-        self.state = SortState::Changed;
+        self.set_changed();
     }
 
     /// Push an element to the end of the [EnhVec].
     pub fn push(&mut self, element: T) {
         self.v.push(element);
-        self.state = SortState::Changed;
+        self.set_changed();
     }
 
     /**
@@ -130,15 +130,7 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
         if last > 0 {
             self.v.swap(0, last);
         }
-
-        match &self.state {
-            SortState::Asc | SortState::Desc => {
-                self.state = SortState::Changed;
-            }
-            _ => {
-                self.state = SortState::Changed;
-            }
-        }
+        self.set_changed();
     }
 }
 
@@ -152,7 +144,7 @@ impl<T> EnhVec<T> {
         self.v.reverse();
         match self.state {
             SortState::Changed | SortState::Unsorted => {
-                self.state = SortState::Changed;
+                self.set_changed();
                 self.sort = Sorting::None;
             }
             SortState::Asc => {
@@ -278,8 +270,16 @@ impl<T> EnhVec<T> {
         self.head.iter().rev().chain(self.v.iter())
     }
     fn internal_iter_mut(&mut self) -> Chain<Rev<IterMut<T>>, IterMut<T>> {
-        self.state = SortState::Changed; // sort state could change
+        self.set_changed(); // order of elements could change
         self.head.iter_mut().rev().chain(self.v.iter_mut())
+    }
+
+    /// Set the internal sorting state to "changed" if it isn't already.
+    #[inline]
+    fn set_changed(&mut self) {
+        if self.state != SortState::Changed {
+            self.state = SortState::Changed;
+        }
     }
 
     /**
