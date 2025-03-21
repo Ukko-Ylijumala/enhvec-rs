@@ -10,9 +10,10 @@ use std::{
     slice::{Iter, IterMut},
 };
 
-/// The default size cutoff for sorting small vectors.
-const SORT_SIZE_CUTOFF: usize = 20;
+/// The default size cutoff for linear/binary search.
+const SEARCH_SIZE_CUTOFF: usize = 32;
 const HEAD_SIZE: usize = 16;
+const LARGE_VEC_THRESHOLD: usize = 256;
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 /// The expected sorting state of an [EnhVec].
@@ -102,23 +103,6 @@ impl<T> EnhVecInner<T> {
         }
     }
 
-    fn insert(&mut self, idx: usize, element: T) {
-        self.main.insert(idx, element);
-        self.set_changed();
-    }
-
-    fn push(&mut self, element: T) {
-        self.main.push(element);
-        self.set_changed();
-    }
-
-    fn push_front(&mut self, element: T) {
-        if self.head.len() + 1 > HEAD_SIZE {
-            self.compact();
-        }
-        self.head.push(element);
-    }
-
     fn push_swap_front(&mut self, element: T) {
         let last: usize = self.main.len(); // len() - 1 after push()
         self.main.push(element);
@@ -166,27 +150,42 @@ impl<T> EnhVecInner<T> {
     }
 
     /**
-    Fold the head elements into the main Vec as the first K elements.
+    Fold the head elements into the main Vec.
+
+    The order of the elements is preserved. If the head is empty, this is a no-op.
 
     Tries to minimize complexity by not reallocating. Instead the head elements
     are appended to the end of the main Vec, then rotated to the front. This is
     a "best effort" method, and may not always be most efficient.
     */
     fn compact(&mut self) {
-        let k: usize = self.head.len();
-        if k == 0 {
+        let head_len: usize = self.head.len();
+        if head_len == 0 {
             return;
         }
         match self.state {
             SortState::Asc => {
                 self.main.extend(self.head.drain(..).rev());
-                self.main.rotate_right(k);
+                self.main.rotate_right(head_len);
             }
             SortState::Desc => {
                 self.main.extend(self.head.drain(..));
             }
             _ => {
-                self.main.append(&mut self.head);
+                self.head.reverse();
+                let main_len: usize = self.main.len();
+                if main_len > LARGE_VEC_THRESHOLD {
+                    // if the main Vec is large, it's computationally cheaper
+                    // to allocate a new Vec and move the elements
+                    let mut tmp: Vec<T> = Vec::with_capacity(main_len + head_len);
+                    tmp.append(&mut self.head);
+                    tmp.append(&mut self.main);
+                    self.main = tmp;
+                } else {
+                    // otherwise, append the head and rotate
+                    self.main.append(&mut self.head);
+                    self.main.rotate_right(head_len);
+                }
                 self.set_changed();
             }
         }
@@ -235,23 +234,12 @@ impl<T> IndexMut<usize> for EnhVecInner<T> {
 
 /* --------------------------------- */
 
-impl<T: PartialOrd + Ord> EnhVecInner<T> {
-    fn sort(&mut self, sorting: &Sorting) {
-        sort_vec(&mut self.main, &self.state, sorting);
-        self.state = match sorting {
-            Sorting::Ascending => SortState::Asc,
-            Sorting::Descending => SortState::Desc,
-            _ => SortState::Unsorted,
-        };
-    }
-}
-
-impl<T: Ord> EnhVecInner<T> {
+impl<T: PartialOrd> EnhVecInner<T> {
     /// Whether the [EnhVecInner] data is sorted in ascending order.
     fn is_sorted(&self) -> bool {
-        match self.main.len() {
+        match self.len() {
             0 | 1 => return true,
-            2 => return self.main[0] <= self.main[1],
+            2 => return self[0] <= self[1],
             _ => {}
         }
         if self.state == SortState::Asc {
@@ -262,9 +250,8 @@ impl<T: Ord> EnhVecInner<T> {
             // short circuit if first > last
             return false;
         }
-        self.main
-            .iter()
-            .zip(self.main.iter().skip(1))
+        self.internal_iter()
+            .zip(self.internal_iter().skip(1))
             .all(|(a, b)| a <= b)
 
         // TODO: check if this is faster than the iter().skip(1)
@@ -273,16 +260,103 @@ impl<T: Ord> EnhVecInner<T> {
         //     self.v.windows(2).all(|w| w[0] <= w[1])
     }
 
+    /// Inserts into the head or main Vec, depending on the index.
+    fn insert(&mut self, idx: usize, element: T) {
+        let head_len: usize = self.head.len();
+        if idx < head_len {
+            // insert into the head Vec even if it's "full", since this likely
+            // saves some extra work now and we can always compact it later
+            self.head.insert(head_len - 1 - idx, element);
+        } else {
+            // insert into the main Vec
+            self.main.insert(idx - head_len, element);
+        }
+        if self.order_changed(idx) {
+            self.set_changed();
+        }
+    }
+
+    fn push(&mut self, element: T) {
+        self.main.push(element);
+        if self.order_changed(self.len() - 1) {
+            self.set_changed();
+        }
+    }
+
+    fn push_front(&mut self, element: T) {
+        if self.head.len() + 1 > HEAD_SIZE {
+            self.compact();
+        }
+        self.head.push(element);
+        if self.order_changed(0) {
+            self.set_changed();
+        }
+    }
+
+    /// Check whether an element addition changed the sort ordering.
+    #[inline]
+    fn order_changed(&self, idx: usize) -> bool {
+        if self.len() == 1 {
+            return false;
+        }
+
+        match self.state {
+            SortState::Unsorted => true,
+            SortState::Changed => false,
+            SortState::Asc => {
+                if idx == 0 {
+                    return self[0] > self[1];
+                }
+                if idx == self.len() - 1 {
+                    return self[idx - 1] > self[idx];
+                }
+                return self[idx - 1] > self[idx] || self[idx] > self[idx + 1];
+            }
+            SortState::Desc => {
+                if idx == 0 {
+                    return self[0] < self[1];
+                }
+                if idx == self.len() - 1 {
+                    return self[idx - 1] < self[idx];
+                }
+                return self[idx - 1] < self[idx] || self[idx] < self[idx + 1];
+            }
+        }
+    }
+}
+
+impl<T: Ord> EnhVecInner<T> {
+    fn sort(&mut self, sorting: &Sorting) {
+        // set changed so that compact() doesn't do extra work
+        self.set_changed();
+        self.compact();
+        sort_vec(&mut self.main, &self.state, sorting);
+        self.state = match sorting {
+            Sorting::Ascending => SortState::Asc,
+            Sorting::Descending => SortState::Desc,
+            _ => SortState::Unsorted,
+        };
+    }
+
     fn insert_sorted(&mut self, element: T) {
+        // short circuit some common cases
         if self.is_empty() || element >= *self.main.last().unwrap() {
-            // short circuit some common cases
             self.main.push(element);
             return;
         }
+        if !self.head.is_empty() && element <= *self.head.last().unwrap() {
+            // head.last() is the smallest element since head is reversed
+            self.head.push(element);
+            return;
+        }
+        if !self.main.is_empty() && element <= *self.main.first().unwrap() {
+            self.head.insert(0, element);
+            return;
+        }
 
-        // determine the insertion point
+        // fold head into main and determine the insertion point
         self.compact();
-        let idx: usize = match self.main.len() < SORT_SIZE_CUTOFF {
+        let idx: usize = match self.main.len() < SEARCH_SIZE_CUTOFF {
             // linear search for "small" vectors
             true => self
                 .internal_iter()
@@ -412,6 +486,7 @@ impl<T> EnhVec<T> {
         self.data.reverse();
         match self.data.state {
             SortState::Changed | SortState::Unsorted => {
+                self.data.state = SortState::Changed;
                 self.sort = Sorting::None;
             }
             SortState::Asc => {
@@ -516,7 +591,7 @@ impl<T> EnhVec<T> {
 
 /* --------------------------------- */
 
-impl<T: Ord> EnhVec<T> {
+impl<T: PartialOrd> EnhVec<T> {
     /**
     Whether the [EnhVec] is sorted in ascending order. Worst case time
     complexity: `O(N)`, as it may have to compare each element with the next.
@@ -526,7 +601,9 @@ impl<T: Ord> EnhVec<T> {
     pub fn is_sorted(&self) -> bool {
         self.data.is_sorted()
     }
+}
 
+impl<T: Ord> EnhVec<T> {
     /**
     Insert an element into the [EnhVec] in sorted order.
 
@@ -543,7 +620,7 @@ impl<T: Ord> EnhVec<T> {
     `O(N log N)`.
     */
     pub fn insert_sorted(&mut self, element: T) {
-        if !self.is_sorted() {
+        if !self.data.is_sorted() {
             self.push(element);
             return;
         }
