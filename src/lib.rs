@@ -214,6 +214,22 @@ impl<T> EnhVecInner<T> {
         self.set_changed(); // order of elements could change
         self.head.iter_mut().rev().chain(self.main.iter_mut())
     }
+
+    fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len() {
+            None
+        } else {
+            Some(&self[index])
+        }
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.len() {
+            None
+        } else {
+            Some(&mut self[index])
+        }
+    }
 }
 
 /* --------------------------------- */
@@ -592,6 +608,13 @@ impl<T> EnhVec<T> {
 
     pub fn pop_front(&mut self) -> Option<T> {
         self.data.pop_front()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&T> {
+        self.data.get(index)
+    }
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        self.data.get_mut(index)
     }
 
     // TODO: find a way to have this return a "normal" Iter<T> and not a Chain<...>
