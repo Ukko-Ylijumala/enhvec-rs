@@ -13,7 +13,7 @@ use std::{
 /// The default size cutoff for linear/binary search.
 const SEARCH_SIZE_CUTOFF: usize = 32;
 const HEAD_SIZE: usize = 16;
-const LARGE_VEC_THRESHOLD: usize = 256;
+const LARGE_VEC_THRESHOLD: usize = 512;
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 /// The expected sorting state of an [EnhVec].
@@ -103,11 +103,28 @@ impl<T> EnhVecInner<T> {
         }
     }
 
+    /**
+    Constant time push to the front of [EnhVecInner]. This method attempts
+    to maintain a semblance of order by swapping elements within the head
+    and between the head and main Vecs. Specifically, it moves the first
+    element of the head to the main Vec, adds the new element to the head,
+    and performs swaps to keep the head partially ordered.
+    */
     fn push_swap_front(&mut self, element: T) {
-        let last: usize = self.main.len(); // len() - 1 after push()
-        self.main.push(element);
-        if last > 0 {
-            self.main.swap(0, last);
+        let head_len: usize = self.head.len();
+        if head_len < HEAD_SIZE {
+            // if the head Vec is not full, just push to it
+            self.head.push(element);
+        } else {
+            // move the 0th element of the head Vec to the main Vec
+            // and push the new element to the head Vec
+            let main_last: usize = self.main.len(); // len() - 1 after push()
+            self.main.push(self.head.swap_remove(0));
+            self.head.push(element);
+            self.head.swap(0, head_len - 2);
+            if main_last > 0 {
+                self.main.swap(0, main_last);
+            }
         }
         self.set_changed();
     }
@@ -150,44 +167,42 @@ impl<T> EnhVecInner<T> {
     }
 
     /**
-    Fold the head elements into the main Vec.
+    Fold the head elements into the main Vec. The order of the elements is
+    preserved. If the head is empty, this is a no-op.
 
-    The order of the elements is preserved. If the head is empty, this is a no-op.
-
-    Tries to minimize complexity by not reallocating. Instead the head elements
-    are appended to the end of the main Vec, then rotated to the front. This is
-    a "best effort" method, and may not always be most efficient.
+    Tries to minimize computational complexity:
+    - for small main, a new Vec is re-allocated and elements are moved to it
+    - for large main, head elements are extended to the end of the main Vec,
+      then rotated to the front
     */
     fn compact(&mut self) {
         let head_len: usize = self.head.len();
         if head_len == 0 {
             return;
         }
-        match self.state {
-            SortState::Asc => {
-                self.main.extend(self.head.drain(..).rev());
-                self.main.rotate_right(head_len);
-            }
-            SortState::Desc => {
-                self.main.extend(self.head.drain(..));
-            }
-            _ => {
-                self.head.reverse();
-                let main_len: usize = self.main.len();
-                if main_len > LARGE_VEC_THRESHOLD {
-                    // if the main Vec is large, it's computationally cheaper
-                    // to allocate a new Vec and move the elements
-                    let mut tmp: Vec<T> = Vec::with_capacity(main_len + head_len);
-                    tmp.append(&mut self.head);
-                    tmp.append(&mut self.main);
-                    self.main = tmp;
-                } else {
-                    // otherwise, append the head and rotate
-                    self.main.append(&mut self.head);
-                    self.main.rotate_right(head_len);
-                }
-                self.set_changed();
-            }
+
+        if self.state == SortState::Desc {
+            // the head Vec is already in the correct order
+            self.main.extend(self.head.drain(..));
+            return;
+        }
+
+        let main_len: usize = self.main.len();
+        if main_len < LARGE_VEC_THRESHOLD {
+            // reallocate if the main Vec is small
+            let mut tmp: Vec<T> = Vec::with_capacity(main_len + head_len);
+            tmp.extend(self.head.drain(..).rev());
+            tmp.append(&mut self.main);
+            self.main = tmp;
+        } else {
+            // if the main Vec is large, it's apparently computationally
+            // cheaper (at least according to the benchmarks) to rotate
+            // the elements in place than to reallocate
+            self.main.extend(self.head.drain(..).rev());
+            self.main.rotate_right(head_len);
+        }
+        if self.state.is_unsorted() {
+            self.set_changed();
         }
     }
 
@@ -1267,8 +1282,7 @@ mod tests {
         assert_eq!(ev.len(), PI_LEN + 1);
 
         let mut test: Vec<u32> = Vec::from_iter(PI_ARR);
-        test.push(XTRA);
-        test.swap(0, PI_LEN);
+        test.insert(0, XTRA);
         assert_eq!(ev.to_vec(), test);
     }
 
