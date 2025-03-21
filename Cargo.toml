@@ -1,6 +1,6 @@
 [package]
 name = "enhvec"
-version = "0.3.7"
+version = "0.3.8"
 authors = ["Mikko Tanner <mikko.tanner@gmail.com>"]
 description = "Enhanced Vec with sorting and mathematics functions"
 readme = "README.md"
@@ -13,3 +13,10 @@ edition = "2021"
 
 [dependencies]
 custom_xxh3 = { git = "https://github.com/Ukko-Ylijumala/custom_xxh3" }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "vec_insert"
+harness = false
