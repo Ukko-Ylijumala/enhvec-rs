@@ -7,14 +7,14 @@ fn bench_rotate_right(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert_head");
     let test_vec: Vec<u32> = (0..APPEND_VEC_SIZE as u32).collect();
 
-    for &size in &[32, 64, 256, 1024, 4096, 8192, 16384, 32768] {
+    for &size in &[64, 256, 512, 1024, 4096, 8192, 16384, 32768] {
         group.bench_with_input(
             BenchmarkId::new("rotate_right", size),
             &size,
             |b, &size| {
                 b.iter(|| {
                     let mut main_vec: Vec<u32> = (0..size).collect();
-                    main_vec.extend_from_slice(&test_vec);
+                    main_vec.extend(test_vec.iter());
                     main_vec.rotate_right(APPEND_VEC_SIZE);
                     main_vec
                 });
