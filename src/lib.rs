@@ -617,13 +617,11 @@ impl<T> EnhVec<T> {
         self.data.get_mut(index)
     }
 
-    // TODO: find a way to have this return a "normal" Iter<T> and not a Chain<...>
-    pub fn iter(&self) -> Chain<Rev<Iter<T>>, Iter<T>> {
-        self.data.internal_iter()
+    pub fn iter(&self) -> EnhVecIter<'_, T> {
+        EnhVecIter::new(&self.data.head, &self.data.main)
     }
-    pub fn iter_mut(&mut self) -> IterMut<T> {
-        // FIXME: implement a proper iter_mut() method
-        self.data.main.iter_mut()
+    pub fn iter_mut(&mut self) -> EnhVecIterMut<'_, T> {
+        EnhVecIterMut::new(&mut self.data.head, &mut self.data.main)
     }
 }
 
@@ -782,6 +780,75 @@ impl<T: PartialEq + PartialOrd> From<Vec<T>> for EnhVec<T> {
         Self::new_from(v)
     }
 }
+
+/* ############################### Iterators ############################### */
+
+/**
+An immutable iterator over the elements of the [EnhVec].
+
+This iterator is a combination of the head and main [Vec]s, with the head
+elements returned in the correct order (since the head is basically a reverse
+cache in front of the main Vec). The iterator is not sorted, unless the
+[EnhVec] is sorted before creating this iterator.
+*/
+#[derive(Debug)]
+pub struct EnhVecIter<'a, T: 'a> {
+    head: Rev<Iter<'a, T>>,
+    main: Iter<'a, T>,
+}
+
+impl<'a, T> EnhVecIter<'a, T> {
+    #[rustfmt::skip]
+    fn new(head: &'a [T], main: &'a [T]) -> Self {
+        Self { head: head.iter().rev(), main: main.iter() }
+    }
+}
+
+impl<'a, T> Iterator for EnhVecIter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.head.next().or_else(|| self.main.next())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len: usize = self.head.len() + self.main.len();
+        (len, Some(len))
+    }
+}
+
+impl<'a, T> ExactSizeIterator for EnhVecIter<'a, T> {}
+
+/* --------------------------------- */
+
+/// A mutable iterator over the elements of the [EnhVec].
+#[derive(Debug)]
+pub struct EnhVecIterMut<'a, T: 'a> {
+    head: Rev<IterMut<'a, T>>,
+    main: IterMut<'a, T>,
+}
+
+impl<'a, T> EnhVecIterMut<'a, T> {
+    #[rustfmt::skip]
+    fn new(head: &'a mut [T], main: &'a mut [T]) -> Self {
+        Self { head: head.iter_mut().rev(), main: main.iter_mut() }
+    }
+}
+
+impl<'a, T> Iterator for EnhVecIterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.head.next().or_else(|| self.main.next())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len: usize = self.head.len() + self.main.len();
+        (len, Some(len))
+    }
+}
+
+impl<'a, T> ExactSizeIterator for EnhVecIterMut<'a, T> {}
 
 /* ################## Hashing and custom hashing behaviour ################# */
 
