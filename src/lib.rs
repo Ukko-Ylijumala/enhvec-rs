@@ -895,6 +895,35 @@ impl<'a, T> Iterator for EnhVecIterMut<'a, T> {
 
 impl<'a, T> ExactSizeIterator for EnhVecIterMut<'a, T> {}
 
+/* --------------------------------- */
+
+impl<'a, T> IntoIterator for EnhVec<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_vec().into_iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a EnhVec<T> {
+    type Item = &'a T;
+    type IntoIter = EnhVecIter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a mut EnhVec<T> {
+    type Item = &'a mut T;
+    type IntoIter = EnhVecIterMut<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
 /* ################## Hashing and custom hashing behaviour ################# */
 
 impl<T: Ord + Hash> Hash for EnhVec<T> {
