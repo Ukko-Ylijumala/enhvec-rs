@@ -369,6 +369,15 @@ impl<T: Ord> EnhVecInner<T> {
         };
     }
 
+    fn sort_by<F>(&mut self, f: F)
+    where
+        F: FnMut(&T, &T) -> Ordering,
+    {
+        self.set_changed(); // cannot know what `f` does to the order
+        self.compact();
+        self.main.sort_by(f);
+    }
+
     fn insert_sorted(&mut self, element: T) {
         // short circuit some common cases
         if self.is_empty() || element >= *self.main.last().unwrap() {
@@ -623,6 +632,23 @@ impl<T> EnhVec<T> {
     pub fn iter_mut(&mut self) -> EnhVecIterMut<'_, T> {
         EnhVecIterMut::new(&mut self.data.head, &mut self.data.main)
     }
+
+    /// Extend this [EnhVec] from an iterator.
+    pub fn extend<I>(&mut self, iter: I)
+    where I: IntoIterator<Item = T>,
+    {
+        self.data.main.extend(iter.into_iter());
+        self.data.set_changed();
+    }
+
+    /// Move all elements from another [EnhVec] into this one. Maintains the
+    /// relative order of the elements. The sort state is set to "None".
+    pub fn append(&mut self, other: &mut Self){
+        self.data.main.extend(&mut other.data.head.drain(..).rev());
+        self.data.main.append(&mut other.data.main);
+        self.data.set_changed();
+        self.sort = Sorting::None;
+    }
 }
 
 /* --------------------------------- */
@@ -670,6 +696,25 @@ impl<T: Ord> EnhVec<T> {
         }
         self.data.sort(&sorting);
         self.sort = sorting;
+    }
+
+    /// Use a comparison Fn to sort the elements. Passthrough to Vec::sort_by().
+    pub fn sort_by<F>(&mut self, f: F)
+    where
+        F: FnMut(&T, &T) -> Ordering,
+    {
+        self.data.sort_by(f);
+    }
+
+    /// Extend this [EnhVec] from an iterator. If the original elements are
+    /// sorted, we will re-sort after the extension.
+    pub fn extend_sorted<I>(&mut self, iter: I)
+    where I: IntoIterator<Item = T>,
+    {
+        self.extend(iter);
+        if self.sort != Sorting::None {
+            self.sort(self.sort);
+        }
     }
 
     /// Return references to entries in ASCending order.
