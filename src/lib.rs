@@ -207,10 +207,10 @@ impl<T> EnhVecInner<T> {
     }
 
     // Internal iterators combining the head and main [Vec]s.
-    fn internal_iter(&self) -> Chain<Rev<Iter<T>>, Iter<T>> {
+    fn internal_iter(&'_ self) -> Chain<Rev<Iter<'_, T>>, Iter<'_, T>> {
         self.head.iter().rev().chain(self.main.iter())
     }
-    fn internal_iter_mut(&mut self) -> Chain<Rev<IterMut<T>>, IterMut<T>> {
+    fn internal_iter_mut(&'_ mut self) -> Chain<Rev<IterMut<'_, T>>, IterMut<'_, T>> {
         self.set_changed(); // order of elements could change
         self.head.iter_mut().rev().chain(self.main.iter_mut())
     }
