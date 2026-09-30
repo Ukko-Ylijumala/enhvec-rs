@@ -563,10 +563,16 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
     }
 
     /**
-    Insert an element at the start of the [EnhVec], keeping the head small:
-    once it has `HEAD_SIZE` elements, a few elements are swapped around
-    instead, so the order of the other elements is not preserved. Mostly
-    useful with `swap_pop_front()`; `push_front()` is as fast and keeps order.
+    Insert an element at the start of the [EnhVec], without ever moving more
+    than a few elements: once the head has `HEAD_SIZE` elements, the new one
+    is swapped in and a few others are moved around instead.
+
+    - Advantage: every call is `O(1)`, with no occasional larger moves
+      (`push_front()` is `O(1)` only amortized, when a Vec grows).
+    - Limitations: the order of the other elements is not preserved, and on
+      average it is slower than `push_front()` (2.5-5x in
+      `benches/vs_std.rs`). Prefer `push_front()` unless you need the
+      worst-case bound and don't care about the order.
     */
     pub fn push_swap_front(&mut self, element: T) {
         self.data.push_swap_front(element);
@@ -693,11 +699,18 @@ impl<T> EnhVec<T> {
     }
 
     /**
-    Remove and return the first element. The counterpart of `push_swap_front()`:
-    if the data is not sorted, the last element may be moved to the front
-    instead of moving half of the elements over like `pop_front()` does at
-    times. Sorted data stays sorted. Time complexity: `O(1)` for unsorted
-    data (not just amortized), else like `pop_front()`.
+    Remove and return the first element, without ever moving more than one
+    element: if the data is not sorted and the head is empty, the last
+    element is swapped into the first place (like `Vec::swap_remove(0)`).
+
+    - Advantage: every call is `O(1)` for unsorted data, with no occasional
+      larger moves (`pop_front()` is `O(1)` only amortized: when the head
+      runs empty, it moves half of the elements over).
+    - Limitations: the order of the remaining elements is not preserved, and
+      on average it is slower than `pop_front()` (1.3-2x in
+      `benches/vs_std.rs`). Sorted data stays sorted, but then this is just
+      `pop_front()`. Prefer `pop_front()` unless you need the worst-case
+      bound and don't care about the order.
     */
     pub fn swap_pop_front(&mut self) -> Option<T> {
         self.data.swap_pop_front()
