@@ -120,6 +120,19 @@ appearance unless asked to sort, so both are deterministic.
   hash the same regardless of their order
 - Stable hashing via the `Xxh3Hashable` trait: `xxh3()` and `xxh3_digest()`
 
+## Performance
+
+`EnhVec` keeps the front of the data in a reversed "head" Vec and the rest in a "main" Vec, so
+pushes and pops at both ends are amortized `O(1)` like with `VecDeque`: when one end runs out,
+half of the elements are moved over from the other one. Sorting and sorted inserts work on a
+single contiguous Vec, and a known sort order makes e.g. re-sorting, `median()` and `range()`
+`O(1)`.
+
+`benches/vs_std.rs` compares it to `Vec` and `VecDeque` on common operations. Roughly: pushes,
+pops and queues at either end are on par with `VecDeque` (often faster), random indexing is a bit
+slower than both, and sorted inserts shift the whole tail like `Vec` does (`VecDeque` shifts the
+shorter side, about 2x faster). Run it with e.g. `cargo bench --bench vs_std -- pop_front`.
+
 ## Type Support
 
 EnhVec supports all standard Rust numeric types through traits:
@@ -139,6 +152,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
+- Unreleased
+    - Amortized `O(1)` `pop_front()` and `pop()` in any mix (two-stack deque), faster indexing and pushes, `benches/vs_std.rs`
 - 0.5.1: Minor fixes, API gaps and faster set operations
     - `Default` no longer requires `T: Default`, `sort_by()` no longer requires `Ord` (e.g. `sort_by(f64::total_cmp)`)
     - Deterministic `mode()` ties and `distinct()` order, no overflow in `average_fp()`
