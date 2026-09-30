@@ -851,13 +851,28 @@ impl<T: PartialEq> EnhVec<T> {
     pub fn is_proper(&self, other: &Self) -> bool {
         self.is_proper_subset(other) || self.is_proper_superset(other)
     }
+    /**
+    Check if the [EnhVec] partially overlaps another [EnhVec]: they share
+    at least one value, but both also have values the other one lacks.
+    Order and duplicates are ignored.
+
+    Any two non-empty sets are in exactly one of these relations:
+    `is_equal()`, `is_proper_subset()`, `is_proper_superset()`,
+    `is_disjoint()` or `is_partial_overlap()`.
+    */
+    pub fn is_partial_overlap(&self, other: &Self) -> bool {
+        self.contains_any(other) && !self.is_subset(other) && !self.is_superset(other)
+    }
     /// Check if the [EnhVec] is a proper subset and superset of another [EnhVec].
+    /// No set can be both, so this checks the closest relation instead.
+    #[deprecated(note = "no set is both a proper subset and superset, use is_partial_overlap()")]
     pub fn is_proper_both(&self, other: &Self) -> bool {
-        self.is_proper_subset(other) && self.is_proper_superset(other)
+        self.is_partial_overlap(other)
     }
     /// Check if the [EnhVec] is a proper subset or superset of another [EnhVec].
+    #[deprecated(note = "same as is_proper()")]
     pub fn is_proper_either(&self, other: &Self) -> bool {
-        self.is_proper_subset(other) || self.is_proper_superset(other)
+        self.is_proper(other)
     }
 }
 
@@ -1980,6 +1995,31 @@ mod tests {
         assert!(big.is_proper_superset(&small) && !dups.is_proper_superset(&small), "is_proper_superset");
         assert!(small.is_proper(&big) && big.is_proper(&small), "is_proper");
         assert!(!small.is_proper(&other) && !small.is_proper(&dups), "is_proper");
+        assert!(small.is_partial_overlap(&other) && other.is_partial_overlap(&small), "is_partial_overlap");
+        assert!(!small.is_partial_overlap(&big) && !small.is_partial_overlap(&dups), "is_partial_overlap, comparable");
+        assert!(!ones.is_partial_overlap(&other), "is_partial_overlap, disjoint");
+
+        // any two non-empty sets are in exactly one of these relations
+        let sets: [&EnhVec<u32>; 5] = [&small, &big, &dups, &other, &ones];
+        for (a, b) in sets.iter().flat_map(|&a| sets.iter().map(move |&b| (a, b))) {
+            let relations: [bool; 5] = [
+                a.is_equal(b), a.is_proper_subset(b), a.is_proper_superset(b),
+                a.is_disjoint(b), a.is_partial_overlap(b),
+            ];
+            let found: usize = relations.iter().filter(|&&r| r).count();
+            assert_eq!(found, 1, "{:?} vs {:?}: {relations:?}", a.to_vec(), b.to_vec());
+        }
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    #[allow(deprecated)]
+    fn test_set_operation_aliases() {
+        let small: EnhVec<u32> = EnhVec::from_iter([1, 2]);
+        let big: EnhVec<u32> = EnhVec::from_iter([3, 2, 1]);
+        let other: EnhVec<u32> = EnhVec::from_iter([2, XTRA]);
+        assert!(small.is_proper_both(&other) && !small.is_proper_both(&big), "is_proper_both");
+        assert!(small.is_proper_either(&big) && !small.is_proper_either(&other), "is_proper_either");
     }
 
     #[test]
