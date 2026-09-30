@@ -289,9 +289,12 @@ impl<T: PartialOrd> EnhVecInner<T> {
     fn insert(&mut self, idx: usize, element: T) {
         let head_len: usize = self.head.len();
         if idx < head_len {
-            // insert into the head Vec even if it's "full", since this likely
-            // saves some extra work now and we can always compact it later
-            self.head.insert(head_len - 1 - idx, element);
+            /*
+            insert into the head Vec even if it's "full", since this likely
+            saves some extra work now and we can always compact it later.
+            Head is reversed: position `head_len - idx` ends up at `idx`.
+            */
+            self.head.insert(head_len - idx, element);
         } else {
             // insert into the main Vec
             self.main.insert(idx - head_len, element);
@@ -1653,5 +1656,19 @@ mod tests {
         let test: Vec<u32> = (1..=top).rev().collect();
         assert_eq!(ev.to_vec(), test);
         assert_eq!(ev.as_sorted_desc(), test.iter().collect::<Vec<&u32>>());
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_insert_into_head() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter([10, 11]);
+        ev.push_front(2);
+        ev.push_front(1);
+        ev.insert(0, 0);
+        assert_eq!(ev.to_vec(), vec![0, 1, 2, 10, 11], "insert at front");
+        ev.insert(2, XTRA);
+        assert_eq!(ev.to_vec(), vec![0, 1, XTRA, 2, 10, 11], "insert inside head");
+        ev.insert(4, XTRA);
+        assert_eq!(ev.to_vec(), vec![0, 1, XTRA, 2, XTRA, 10, 11], "insert at head/main junction");
     }
 }
