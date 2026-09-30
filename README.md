@@ -86,6 +86,11 @@ The elements are always one slice, in order, so all slice methods work on an `En
 (`as_mut_slice()`, mutable slice methods or indexing) resets the known sort order.
 `binary_search()` follows the known order, so it also works on data sorted in descending order.
 
+With a known order (after `sort()`, or found by `insert_sorted()`), `contains()`, `count()` and
+`binary_search()` are `O(log N)`, and `mode()`, `distinct()` and `set_relation_sorted()` work
+on the elements in place, without hashing or sorting: ~600x faster lookups in 1M elements, and
+3-18x for the rest.
+
 `sort_unstable()` and `sort_unstable_by()` may reorder equal elements, but are ~1.5x faster and
 allocate nothing. For numbers, and other types whose equal elements are indistinguishable, the
 result is the same as with `sort()`.
@@ -93,7 +98,8 @@ result is the same as with `sort()`.
 ### Set Operations
 
 Values are compared as sets, i.e. order and duplicates are ignored. Only `PartialEq` is
-required, so these are `O(N * M)`.
+required, so these are `O(N * M)`, but the lookups in an `EnhVec` with a known order are binary
+searches: `O(M log N)`.
 
 - `contains_all()`, `contains_any()`, `contains_only()`
 - `is_subset()`, `is_superset()`, `is_proper_subset()`, `is_proper_superset()`, `is_proper()`
@@ -183,8 +189,9 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
-- Unreleased: Slice API
+- Unreleased: Slice API, faster lookups in a known order
     - `Deref`/`DerefMut` to `[T]`, `AsMut<[T]>`, indexing with ranges, `binary_search()` in the known order
+    - With a known order: `contains()`, `count()` and the set operations binary search, and `mode()`, `distinct()` and `set_relation_sorted()` need no hashing or sorting
 - 0.6.0: One buffer for all elements, with free space at both ends
     - The elements are always one slice: indexing and iteration run at `Vec` speed, `From<Vec<T>>` and `into_vec()` reuse the buffer
     - Pushes as fast as `Vec::push()`, `O(1)` pops at both ends without moving elements (2-7x faster), faster queues; sorted inserts ~20% slower, as one buffer shifts more elements than two

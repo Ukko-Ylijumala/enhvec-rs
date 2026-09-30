@@ -331,10 +331,33 @@ impl<T: Debug> Debug for DeBuf<T> {
 /* --------------------------------- */
 
 /// The actual internal representation of the [EnhVec].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct EnhVecInner<T> {
     state: SortState,
+    /**
+    `T::cmp`, kept by the methods that set a known order (ASC or DESC), which
+    all require [Ord], see `set_order()`. With it, methods that only require
+    [PartialEq] (e.g. `contains()`) can binary search data in a known order,
+    see `ordering()`: [Ord] must agree with [PartialEq], so the results are
+    the same as those of a linear scan.
+
+    NOTE: this is a workaround for specialization, which stable Rust does not
+    have yet (rust-lang/rust#31844). Revisit when it is stable: those methods
+    could then have a specialized version for `T: Ord` instead, which also
+    lets `T::cmp` be inlined instead of called through this pointer.
+    */
+    cmp: Option<fn(&T, &T) -> Ordering>,
     buf: DeBuf<T>,
+}
+
+// Implemented by hand, to leave out `cmp`
+impl<T: Debug> Debug for EnhVecInner<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EnhVecInner")
+            .field("state", &self.state)
+            .field("buf", &self.buf)
+            .finish()
+    }
 }
 
 impl<T> EnhVecInner<T> {
@@ -352,6 +375,7 @@ impl<T> EnhVecInner<T> {
     fn new() -> Self {
         Self {
             state: SortState::Unsorted,
+            cmp: None,
             buf: DeBuf::new(),
         }
     }
@@ -393,6 +417,22 @@ impl<T> EnhVecInner<T> {
     #[inline]
     fn set_changed(&mut self) {
         self.state = SortState::Changed;
+    }
+
+    /**
+    How `a` compares to `b` in the known order: `T::cmp`, reversed for DESC.
+    `None` if the order is not known. Lets methods without an [Ord] bound
+    binary search, see `cmp`.
+    */
+    fn ordering(&self) -> Option<impl Fn(&T, &T) -> Ordering> {
+        let desc: bool = match self.state {
+            SortState::Asc => false,
+            SortState::Desc => true,
+            _ => return None,
+        };
+        debug_assert!(self.cmp.is_some(), "a known order without T::cmp");
+        let cmp: fn(&T, &T) -> Ordering = self.cmp?;
+        Some(move |a: &T, b: &T| if desc { cmp(b, a) } else { cmp(a, b) })
     }
 
     /**
@@ -583,11 +623,19 @@ impl<T: PartialOrd> EnhVecInner<T> {
 impl<T: Ord> EnhVecInner<T> {
     fn sort(&mut self, sorting: &Sorting, stable: bool) {
         sort_vec(self.buf.as_mut_slice(), &self.state, sorting, stable);
-        self.state = match sorting {
-            Sorting::Ascending => SortState::Asc,
-            Sorting::Descending => SortState::Desc,
-            _ => SortState::Unsorted,
-        };
+        match sorting {
+            Sorting::Ascending => self.set_order(SortState::Asc),
+            Sorting::Descending => self.set_order(SortState::Desc),
+            _ => self.state = SortState::Unsorted,
+        }
+    }
+
+    /// Set a known order (ASC or DESC), and keep `T::cmp` for the methods
+    /// without an [Ord] bound, see `cmp`. Every known order is set here.
+    fn set_order(&mut self, state: SortState) {
+        debug_assert!(state.is_sorted());
+        self.cmp = Some(T::cmp);
+        self.state = state;
     }
 
     /**
@@ -941,7 +989,7 @@ impl<T: Ord> EnhVec<T> {
                     return;
                 }
             };
-            self.data.state = state;
+            self.data.set_order(state);
         }
         self.data.insert_sorted(element);
     }
@@ -1008,30 +1056,45 @@ impl<T: Ord> EnhVec<T> {
         vec
     }
 
-    /// References to the elements in ASCending order, sorted only if the order
-    /// is not known. Equal elements come in no particular order.
-    fn asc_refs(&self) -> Vec<&T> {
-        let mut refs: Vec<&T> = self.as_ref_vec();
+    /// The elements in ASCending order: the slice itself if the order is
+    /// known, else sorted references. Equal elements come in no particular order.
+    fn asc_view(&self) -> AscView<'_, T> {
         match self.data.state {
-            SortState::Asc => {}
-            SortState::Desc => refs.reverse(),
-            _ => refs.sort_unstable(),
+            SortState::Asc => AscView::Asc(self.as_slice()),
+            SortState::Desc => AscView::Desc(self.as_slice()),
+            _ => {
+                let mut refs: Vec<&T> = self.as_ref_vec();
+                refs.sort_unstable();
+                AscView::Refs(refs)
+            }
         }
-        refs
     }
 }
 
 /* --------------------------------- */
 
 impl<T: PartialEq> EnhVec<T> {
-    /// Count the occurrences of a value.
+    /// Count the occurrences of a value. Time complexity: `O(log N)` if the
+    /// order is known (e.g. after `sort()`), else `O(N)`.
     pub fn count(&self, value: &T) -> usize {
-        self.data.internal_iter().filter(|&x| x == value).count()
+        let Some(ord) = self.data.ordering() else {
+            return self.data.internal_iter().filter(|&x| x == value).count();
+        };
+        // the equal elements are next to each other
+        let elements: &[T] = self.as_slice();
+        let start: usize = elements.partition_point(|x: &T| ord(x, value) == Ordering::Less);
+        let rest: &[T] = &elements[start..];
+        rest.partition_point(|x: &T| ord(x, value) == Ordering::Equal)
     }
 
-    /// Check if the [EnhVec] contains a value.
+    /// Check if the [EnhVec] contains a value. Time complexity: `O(log N)`
+    /// if the order is known (e.g. after `sort()`), else `O(N)`.
     pub fn contains(&self, value: &T) -> bool {
-        self.data.internal_iter().any(|x: &T| x == value)
+        let Some(ord) = self.data.ordering() else {
+            return self.data.internal_iter().any(|x: &T| x == value);
+        };
+        let found: Result<usize, usize> = self.as_slice().binary_search_by(|x: &T| ord(x, value));
+        found.is_ok()
     }
     /// Check if the [EnhVec] contains all values in another [EnhVec].
     pub fn contains_all(&self, other: &Self) -> bool {
@@ -1107,8 +1170,10 @@ impl<T: PartialEq> EnhVec<T> {
 
     /**
     How this and another [EnhVec] relate as sets, see [SetRelation].
-    Time complexity: `O(N * M)`, as only [PartialEq] is available. See
-    `set_relation_hashed()` and `set_relation_sorted()` for faster ones.
+    Time complexity: `O(N * M)`, as only [PartialEq] is available, but the
+    lookups in one with a known order are binary searches (`contains()`):
+    `O((N + M) log(N + M))` if both have one. See `set_relation_hashed()` and
+    `set_relation_sorted()` for faster ones.
     */
     pub fn set_relation(&self, other: &Self) -> SetRelation {
         let mut rel: SetRelation = SetRelation::default();
@@ -1206,12 +1271,13 @@ impl<T: Ord> EnhVec<T> {
     both is known (ASC or DESC), else `O(N log N + M log M)`. No hashing.
     */
     pub fn set_relation_sorted(&self, other: &Self) -> SetRelation {
-        let (left, right): (Vec<&T>, Vec<&T>) = (self.asc_refs(), other.asc_refs());
+        let (left, right): (AscView<T>, AscView<T>) = (self.asc_view(), other.asc_view());
+        let (left_len, right_len): (usize, usize) = (left.len(), right.len());
         let mut rel: SetRelation = SetRelation::default();
         let (mut i, mut j): (usize, usize) = (0, 0);
         // stop early once all is known
-        while i < left.len() && j < right.len() && !rel.is_partial_overlap() {
-            match left[i].cmp(right[j]) {
+        while i < left_len && j < right_len && !rel.is_partial_overlap() {
+            match left.get(i).cmp(right.get(j)) {
                 Ordering::Less => {
                     rel.left_only = true;
                     i += 1;
@@ -1223,19 +1289,48 @@ impl<T: Ord> EnhVec<T> {
                 Ordering::Equal => {
                     rel.shared = true;
                     // skip the duplicates of this value on both sides
-                    let value: &T = left[i];
-                    while i < left.len() && left[i] == value {
+                    let value: &T = left.get(i);
+                    while i < left_len && left.get(i) == value {
                         i += 1;
                     }
-                    while j < right.len() && right[j] == value {
+                    while j < right_len && right.get(j) == value {
                         j += 1;
                     }
                 }
             }
         }
-        rel.left_only |= i < left.len();
-        rel.right_only |= j < right.len();
+        rel.left_only |= i < left_len;
+        rel.right_only |= j < right_len;
         rel
+    }
+}
+
+/// The elements of an [EnhVec] in ASCending order, see `asc_view()`.
+enum AscView<'a, T> {
+    /// The elements, known to be in ascending order.
+    Asc(&'a [T]),
+    /// The elements, known to be in descending order: read backwards.
+    Desc(&'a [T]),
+    /// References to the elements, sorted.
+    Refs(Vec<&'a T>),
+}
+
+impl<'a, T> AscView<'a, T> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Asc(elements) | Self::Desc(elements) => elements.len(),
+            Self::Refs(refs) => refs.len(),
+        }
+    }
+
+    /// The element at position `i` in ascending order.
+    #[inline]
+    fn get(&self, i: usize) -> &'a T {
+        match self {
+            Self::Asc(elements) => &elements[i],
+            Self::Desc(elements) => &elements[elements.len() - 1 - i],
+            Self::Refs(refs) => refs[i],
+        }
     }
 }
 
@@ -1559,8 +1654,17 @@ impl<T: Copy + Sum> EnhVec<T> {
 
 impl<T: Copy + Eq + Hash> EnhVec<T> {
     /// Return the mode (most common) value of the elements. If several values
-    /// are equally common, the one that appears first is returned.
+    /// are equally common, the one that appears first is returned. In a known
+    /// order, equal values are counted in place, without hashing.
     pub fn mode(&self) -> Option<T> {
+        if self.data.state.is_sorted() {
+            // equal elements are next to each other, so the longest run wins
+            // (the first of equally long ones: max_by_key() picks the last)
+            let runs = self.as_slice().chunk_by(|a: &T, b: &T| a == b);
+            let longest: Option<&[T]> = runs.rev().max_by_key(|run: &&[T]| run.len());
+            return longest.map(|run: &[T]| run[0]);
+        }
+
         let mut counts: HashMap<T, usize> = HashMap::new();
         for &item in self.data.internal_iter() {
             *counts.entry(item).or_insert(0) += 1;
@@ -1575,25 +1679,31 @@ impl<T: Copy + Eq + Hash> EnhVec<T> {
     }
 
     /// Return the distinct (unique) elements in the order of their first
-    /// appearance, or sorted if requested.
+    /// appearance, or sorted if requested. In a known order, duplicates are
+    /// dropped without hashing, and the result keeps the known order.
     pub fn distinct(&self, sorted: Option<Sorting>) -> EnhVec<T>
     where
         T: Copy + Eq + Hash + Ord,
     {
-        let mut seen: HashSet<T> = HashSet::new();
-        let unique: Vec<T> = self
-            .data
-            .internal_iter()
-            .copied()
-            .filter(|&x| seen.insert(x))
-            .collect();
+        let known_order: bool = self.data.state.is_sorted();
+        let unique: Vec<T> = if known_order {
+            // equal elements are next to each other, so no hashing is needed
+            let mut unique: Vec<T> = self.to_vec();
+            unique.dedup();
+            unique
+        } else {
+            let mut seen: HashSet<T> = HashSet::new();
+            let elements = self.data.internal_iter().copied();
+            elements.filter(|&x| seen.insert(x)).collect()
+        };
         let mut result: EnhVec<T> = EnhVec::new_from(unique);
-        if self.data.state.is_sorted() {
+        if known_order {
             // dropping duplicates keeps a known order
-            result.data.state = self.data.state.clone();
+            result.data.set_order(self.data.state.clone());
         }
         if let Some(sorting) = sorted {
             // the elements are unique, so this is the same as a stable sort
+            // (and in a known order, a no-op or a reversal)
             result.sort_unstable(sorting);
         }
         result
@@ -2939,6 +3049,58 @@ mod tests {
                 rel.is_partial_overlap(),
             ];
             assert_eq!(found, expected, "predicates, {msg}");
+        }
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_known_order_lookups() {
+        // duplicates, and values between and around them
+        let data: [u32; 8] = [5, 1, 3, 3, 9, 1, 7, 3];
+        let unknown: EnhVec<u32> = EnhVec::from_iter(data);
+        let (mut asc, mut desc): (EnhVec<u32>, EnhVec<u32>) = (unknown.clone(), unknown.clone());
+        asc.sort(Sorting::Ascending);
+        desc.sort(Sorting::Descending);
+        assert!(unknown.data.ordering().is_none(), "no known order");
+        assert!(asc.data.ordering().is_some() && desc.data.ordering().is_some(), "known orders");
+        for ev in [&unknown, &asc, &desc] {
+            for x in 0..=10 {
+                let count: usize = data.iter().filter(|&&y| y == x).count();
+                assert_eq!(ev.count(&x), count, "count({x}) in {:?}", ev.as_slice());
+                assert_eq!(ev.contains(&x), count > 0, "contains({x}) in {:?}", ev.as_slice());
+            }
+        }
+
+        // kept by clone() and reverse(), and set when insert_sorted() finds the order
+        let mut reversed: EnhVec<u32> = asc.clone();
+        reversed.reverse();
+        assert!(reversed.data.ordering().is_some(), "reversed");
+        assert!(reversed.contains(&9) && reversed.count(&3) == 3, "reversed lookups");
+        let mut found: EnhVec<u32> = EnhVec::from_iter([1, 3, 5]);
+        found.insert_sorted(4);
+        assert!(found.data.ordering().is_some() && found.count(&4) == 1, "insert_sorted()");
+
+        // gone with the known order
+        asc.push(0);
+        assert!(asc.data.ordering().is_none() && asc.contains(&0), "order changed");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_mode_and_distinct_in_known_order() {
+        // 2 and 4 are equally common
+        let data: [u32; 9] = [4, 2, 2, 7, 4, 1, 7, 2, 4];
+        for order in [Sorting::Ascending, Sorting::Descending] {
+            let mut ev: EnhVec<u32> = EnhVec::from_iter(data);
+            ev.sort(order);
+            // the hashing versions, on the same elements in the same order
+            let hashed: EnhVec<u32> = EnhVec::from(ev.to_vec());
+            assert_eq!(ev.mode(), hashed.mode(), "mode(), {order:?}");
+            for sorting in [None, Some(Sorting::Ascending), Some(Sorting::Descending)] {
+                let (unique, expected) = (ev.distinct(sorting), hashed.distinct(sorting));
+                assert_eq!(unique.as_slice(), expected.as_slice(), "distinct({sorting:?}), {order:?}");
+                assert!(unique.data.ordering().is_some(), "distinct() keeps the known order");
+            }
         }
     }
 
