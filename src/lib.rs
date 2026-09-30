@@ -1012,9 +1012,13 @@ impl<T: Ord + Hash> Hash for EnhVec<T> {
 
     To produce truly repeatable hashes, it is recommended to use the `xxh3()`
     or `xxh3_digest()` methods instead, which use a stable hasher.
+
+    Like the standard slice hash, the length is hashed first, so that e.g.
+    the tuples `([1, 2], [3])` and `([1], [2, 3])` do not collide.
     */
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_usize(self.len());
         self.as_sorted_asc()
             .iter()
             .for_each(|elem| elem.hash(state));
@@ -1029,9 +1033,13 @@ impl<T: Ord + Xxh3Hashable> Xxh3Hashable for EnhVec<T> {
 
     The element in question must implement the [Xxh3Hashable] trait and
     actually hash itself using the `xxh3()` method of course.
+
+    The length is hashed first (see [Hash]), as a little-endian `u64` to
+    keep the result the same across platforms.
     */
     #[inline]
     fn xxh3<H: Hasher>(&self, state: &mut H) {
+        state.write(&(self.len() as u64).to_le_bytes());
         self.as_sorted_asc()
             .iter()
             .for_each(|elem| elem.xxh3(state));
@@ -1044,9 +1052,7 @@ impl<T: Ord + Xxh3Hashable> Xxh3Hashable for EnhVec<T> {
     #[inline]
     fn xxh3_digest(&self) -> u64 {
         let mut hasher: CustomXxh3Hasher = CustomXxh3Hasher::default();
-        self.as_sorted_asc()
-            .iter()
-            .for_each(|elem| elem.xxh3(&mut hasher));
+        self.xxh3(&mut hasher);
         hasher.finish()
     }
 }
@@ -1425,7 +1431,7 @@ fn sort_vec<T: Ord>(v: &mut Vec<T>, state: &SortState, desired: &Sorting) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::iter::from_fn;
+    use std::{hash::DefaultHasher, iter::from_fn};
 
     const PI_LEN: usize = 16;
     const PI_SUM: u32 = 80;
@@ -1435,6 +1441,31 @@ mod tests {
     const FP_ARR: [f64; 7] = [-999.0, 1.0, 2.0, 3.0, 4.0, 5.0, 999.0];
     const XTRA: u32 = 99;
     const EPSILON: f64 = 1e-10;
+
+    /// Minimal [Xxh3Hashable] element for the hashing tests.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    struct XxhU32(u32);
+
+    impl Xxh3Hashable for XxhU32 {
+        fn xxh3<H: Hasher>(&self, state: &mut H) {
+            state.write(&self.0.to_le_bytes());
+        }
+        fn xxh3_digest(&self) -> u64 {
+            let mut hasher: CustomXxh3Hasher = CustomXxh3Hasher::default();
+            self.xxh3(&mut hasher);
+            hasher.finish()
+        }
+    }
+
+    fn std_hash<T: Hash>(value: &T) -> u64 {
+        let mut hasher: DefaultHasher = DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn xxh3_vec(values: &[u32]) -> EnhVec<XxhU32> {
+        EnhVec::from_iter(values.iter().map(|&x: &u32| XxhU32(x)))
+    }
 
     #[test]
     fn test_new_and_push() {
@@ -1944,5 +1975,30 @@ mod tests {
         assert_ne!(ev1, ev2, "different elements");
         let ev3: EnhVec<u32> = EnhVec::from_iter([3, 2, 1]);
         assert_ne!(ev1, ev3, "different order");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_hash() {
+        let ev_asc: EnhVec<u32> = EnhVec::from_iter(PI_ASC);
+        let ev_arr: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        assert_eq!(std_hash(&ev_asc), std_hash(&ev_arr), "Hash ignores order");
+        let pair1: (EnhVec<u32>, EnhVec<u32>) = (EnhVec::from_iter([1, 2]), EnhVec::from_iter([3]));
+        let pair2: (EnhVec<u32>, EnhVec<u32>) = (EnhVec::from_iter([1]), EnhVec::from_iter([2, 3]));
+        assert_ne!(std_hash(&pair1), std_hash(&pair2), "Hash of adjacent EnhVecs");
+
+        let xxh_asc: EnhVec<XxhU32> = xxh3_vec(&PI_ASC);
+        assert_eq!(xxh_asc.xxh3_digest(), xxh3_vec(&PI_ARR).xxh3_digest(), "xxh3 ignores order");
+        let mut hasher: CustomXxh3Hasher = CustomXxh3Hasher::default();
+        xxh_asc.xxh3(&mut hasher);
+        assert_eq!(hasher.finish(), xxh_asc.xxh3_digest(), "xxh3_digest() == xxh3() + finish()");
+
+        let digest = |a: &[u32], b: &[u32]| {
+            let mut hasher: CustomXxh3Hasher = CustomXxh3Hasher::default();
+            xxh3_vec(a).xxh3(&mut hasher);
+            xxh3_vec(b).xxh3(&mut hasher);
+            hasher.finish()
+        };
+        assert_ne!(digest(&[1, 2], &[3]), digest(&[1], &[2, 3]), "xxh3 of adjacent EnhVecs");
     }
 }
