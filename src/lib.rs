@@ -786,6 +786,24 @@ impl<T: Ord> EnhVec<T> {
         sort_vec(&mut vec, &self.data.state, &Sorting::Descending);
         vec
     }
+
+    /**
+    Run a closure on each element in ASCending order, for hashing. Unlike
+    iterating `as_sorted_asc()`, nothing is collected or sorted if the order
+    is known, and otherwise equal elements may come in any order: they are
+    equal by [Eq] too (see [Ord]), so they also hash the same.
+    */
+    fn for_each_asc(&self, f: impl FnMut(&T)) {
+        match self.data.state {
+            SortState::Asc => self.data.internal_iter().for_each(f),
+            SortState::Desc => self.data.internal_iter().rev().for_each(f),
+            _ => {
+                let mut refs: Vec<&T> = self.as_ref_vec();
+                refs.sort_unstable();
+                refs.into_iter().for_each(f)
+            }
+        }
+    }
 }
 
 /* --------------------------------- */
@@ -1031,9 +1049,7 @@ impl<T: Ord + Hash> Hash for EnhVec<T> {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_usize(self.len());
-        self.as_sorted_asc()
-            .iter()
-            .for_each(|elem| elem.hash(state));
+        self.for_each_asc(|elem: &T| elem.hash(state));
     }
 }
 
@@ -1052,9 +1068,7 @@ impl<T: Ord + Xxh3Hashable> Xxh3Hashable for EnhVec<T> {
     #[inline]
     fn xxh3<H: Hasher>(&self, state: &mut H) {
         state.write(&(self.len() as u64).to_le_bytes());
-        self.as_sorted_asc()
-            .iter()
-            .for_each(|elem| elem.xxh3(state));
+        self.for_each_asc(|elem: &T| elem.xxh3(state));
     }
 
     /**
@@ -1083,14 +1097,20 @@ where
     T: Copy + Ord + Sub<Output = T>,
 {
     /// Return the range (max - min) of the elements.
+    /// Time complexity: `O(1)` if the order is known, else `O(N)`.
     pub fn range(&self) -> Option<T> {
-        if let (Some(min), Some(max)) = (
-            self.data.internal_iter().min(),
-            self.data.internal_iter().max(),
-        ) {
-            Some(*max - *min)
-        } else {
-            None
+        let (first, last): (T, T) = (*self.first()?, *self.last()?);
+        match self.data.state {
+            SortState::Asc => Some(last - first),
+            SortState::Desc => Some(first - last),
+            _ => {
+                // min and max in a single pass
+                let (min, max): (T, T) = self
+                    .data
+                    .internal_iter()
+                    .fold((first, first), |(min, max), &x| (min.min(x), max.max(x)));
+                Some(max - min)
+            }
         }
     }
 }
@@ -1132,20 +1152,39 @@ impl<T: Copy + Eq + Hash> EnhVec<T> {
 /* --------------------------------- */
 
 impl<T: Integer> EnhVec<T> {
+    /**
+    The element at position `idx` of the data in ASCending order, and if
+    `with_next`, the one after it. Time complexity: `O(1)` if the order is
+    known, else `O(N)` (selection on a copy of the data, not a full sort).
+    */
+    fn select_asc(&self, idx: usize, with_next: bool) -> (T, Option<T>) {
+        if !self.data.state.is_sorted() {
+            return select_by(&mut self.to_vec(), idx, with_next, T::cmp);
+        }
+        let len: usize = self.len();
+        let at_asc = |i: usize| match self.data.state {
+            SortState::Desc => self.data[len - 1 - i],
+            _ => self.data[i],
+        };
+        let next: Option<T> = (with_next && idx + 1 < len).then(|| at_asc(idx + 1));
+        (at_asc(idx), next)
+    }
+
     /// Return the median (aka. the middle) value of the elements.
+    /// Time complexity: `O(1)` if the order is known, else `O(N)`.
     pub fn median(&self) -> Option<T> {
         if self.is_empty() {
             return None;
         }
 
-        let sorted: Vec<&T> = self.as_sorted_asc();
-        let mid: usize = sorted.len() / 2;
+        let mid: usize = self.len() / 2;
 
-        if sorted.len() % 2 == 0 {
+        if self.len() % 2 == 0 {
             // unlike `(a + b) / 2`, midpoint() cannot overflow
-            Some(T::midpoint(*sorted[mid - 1], *sorted[mid]))
+            let (below, above): (T, Option<T>) = self.select_asc(mid - 1, true);
+            above.map(|above: T| T::midpoint(below, above))
         } else {
-            Some(*sorted[mid])
+            Some(self.select_asc(mid, false).0)
         }
     }
 
@@ -1209,9 +1248,8 @@ impl<T: Integer> EnhVec<T> {
             return None;
         }
 
-        let sorted: Vec<&T> = self.as_sorted_asc();
         let index: usize = (p * (self.len() - 1) as f64).round() as usize;
-        Some(*sorted[index])
+        Some(self.select_asc(index, false).0)
     }
 }
 
@@ -1225,15 +1263,15 @@ impl<T: Float> EnhVec<T> {
             return None;
         }
 
-        let mut sorted: Vec<T> = self.to_vec();
-        sorted.sort_by(T::total_cmp);
-        let mid: usize = sorted.len() / 2;
+        let mut data: Vec<T> = self.to_vec();
+        let mid: usize = data.len() / 2;
 
-        if sorted.len() % 2 == 0 {
+        if data.len() % 2 == 0 {
             // unlike `(a + b) / 2`, midpoint() cannot overflow to infinity
-            Some(T::midpoint(sorted[mid - 1], sorted[mid]))
+            let (below, above): (T, Option<T>) = select_by(&mut data, mid - 1, true, T::total_cmp);
+            above.map(|above: T| T::midpoint(below, above))
         } else {
-            Some(sorted[mid])
+            Some(select_by(&mut data, mid, false, T::total_cmp).0)
         }
     }
 
@@ -1283,10 +1321,8 @@ impl<T: Float> EnhVec<T> {
             return None;
         }
 
-        let mut sorted: Vec<T> = self.to_vec();
-        sorted.sort_by(T::total_cmp);
         let index: usize = (p * (self.len() - 1) as f64).round() as usize;
-        Some(sorted[index])
+        Some(select_by(&mut self.to_vec(), index, false, T::total_cmp).0)
     }
 }
 
@@ -1434,6 +1470,22 @@ impl_float!(f32, f64);
 
 /* ########################### Utility functions ########################### */
 
+/**
+The element a full sort of `v` by `cmp` would put at `idx`, and if `with_next`,
+the one it would put right after it. Reorders `v`. Time complexity: `O(N)`.
+*/
+fn select_by<T: Copy, F>(v: &mut [T], idx: usize, with_next: bool, mut cmp: F) -> (T, Option<T>)
+where
+    F: FnMut(&T, &T) -> Ordering,
+{
+    let (_, nth, above) = v.select_nth_unstable_by(idx, &mut cmp);
+    let next: Option<T> = match with_next {
+        true => above.iter().copied().min_by(|a: &T, b: &T| cmp(a, b)),
+        false => None,
+    };
+    (*nth, next)
+}
+
 /// Sort a vector in place, based on the current and desired sorting state.
 fn sort_vec<T: Ord>(v: &mut Vec<T>, state: &SortState, desired: &Sorting) {
     // short circuit no-ops
@@ -1498,6 +1550,25 @@ mod tests {
 
     fn xxh3_vec(values: &[u32]) -> EnhVec<XxhU32> {
         EnhVec::from_iter(values.iter().map(|&x: &u32| XxhU32(x)))
+    }
+
+    /// Check the order based statistics of `ev` against a full sort of `data`.
+    fn check_order_stats(ev: &EnhVec<u32>, data: &[u32], msg: &str) {
+        let mut sorted: Vec<u32> = data.to_vec();
+        sorted.sort();
+        let (n, mid): (usize, usize) = (sorted.len(), sorted.len() / 2);
+        let median: u32 = match n % 2 {
+            0 => sorted[mid - 1].midpoint(sorted[mid]),
+            _ => sorted[mid],
+        };
+        assert_eq!(ev.median(), Some(median), "median, {msg}");
+        assert_eq!(ev.range(), Some(sorted[n - 1] - sorted[0]), "range, {msg}");
+        for p in (0..=20).map(|i: u32| i as f64 / 20.0) {
+            let idx: usize = (p * (n - 1) as f64).round() as usize;
+            assert_eq!(ev.percentile(p), Some(sorted[idx]), "percentile {p}, {msg}");
+        }
+        let hash: u64 = std_hash(&EnhVec::from_iter(sorted));
+        assert_eq!(std_hash(ev), hash, "Hash, {msg}");
     }
 
     #[test]
@@ -2071,6 +2142,29 @@ mod tests {
                 let idx: usize = next(model.len());
                 assert_eq!(ev[idx], model[idx], "index {idx}, step {step}");
             }
+        }
+    }
+
+    #[test]
+    fn test_order_stats_known_order() {
+        // even and odd length
+        for data in [&PI_ARR[..], &PI_ARR[1..]] {
+            let unsorted: EnhVec<u32> = EnhVec::from_iter(data.iter().copied());
+            check_order_stats(&unsorted, data, "unknown order");
+
+            let mut asc: EnhVec<u32> = unsorted.clone();
+            asc.sort(Sorting::Ascending);
+            check_order_stats(&asc, data, "ASC");
+            asc.push_front(0); // keeps ASC, lands in the head
+            assert!(asc.data.state == SortState::Asc && !asc.data.head.is_empty());
+            check_order_stats(&asc, &[data, &[0]].concat(), "ASC with head");
+
+            let mut desc: EnhVec<u32> = unsorted.clone();
+            desc.sort(Sorting::Descending);
+            check_order_stats(&desc, data, "DESC");
+            desc.push_front(XTRA); // keeps DESC, lands in the head
+            assert!(desc.data.state == SortState::Desc && !desc.data.head.is_empty());
+            check_order_stats(&desc, &[data, &[XTRA]].concat(), "DESC with head");
         }
     }
 
