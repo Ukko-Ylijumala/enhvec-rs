@@ -132,14 +132,15 @@ untrusted data as `HashMap` keys.
 
 ## Performance
 
-`EnhVec` keeps the front of the data in a reversed "head" Vec and the rest in a "main" Vec, so
-pushes and pops at both ends are amortized `O(1)` like with `VecDeque`: when one end runs out,
-half of the elements are moved over from the other one. Sorting and sorted inserts work on a
-single contiguous Vec, and a known sort order makes e.g. re-sorting, `median()` and `range()`
-`O(1)`.
+`EnhVec` keeps the front of the data in a "head" buffer and the rest in a "main" Vec. The head
+holds its elements in their normal order, with free space before and after them, so it grows at
+both ends. Pushes and pops at both ends are amortized `O(1)` like with `VecDeque`: `pop()`
+continues at the back of the head once main is empty, and when `pop_front()` empties the head,
+half of main is moved over. Sorting works on a single contiguous Vec, and a known sort order makes
+e.g. re-sorting, `median()` and `range()` `O(1)`.
 
 Inserts in the middle rebalance head and main when needed, so that like with `VecDeque` they
-shift at most about half of the elements.
+shift at most about half of the elements. In the head, they shift the shorter side.
 
 `benches/vs_std.rs` compares it to `Vec` and `VecDeque` on common operations. Roughly: pushes,
 pops, queues and sorted inserts are on par with `VecDeque` (often faster). Random indexing is a
@@ -166,6 +167,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
+- Unreleased
+    - The head keeps its elements in their normal order, with free space at both ends: faster sorted inserts, `push_swap_front()` and indexing, `pop()` needs no refill
 - 0.5.3: Faster float sums, sorting and hashing
     - Float sums in `average_fp()`, `variance_fp()` and `variance()` use independent partial sums: ~6x faster on large data
     - `sort_unstable()` and `sort_unstable_by()`, ~1.5x faster than `sort()`, also used by `distinct()`
