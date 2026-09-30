@@ -75,8 +75,10 @@ let unique = vec.distinct(Some(Sorting::Ascending));
 - `iter()`, `iter_mut()` (double-ended, e.g. `iter().rev()`), `IntoIterator` for `EnhVec` and its references
 - `for_each()`, `for_each_if()`, `modify_each()`, `modify_each_if()`, `count()`, `contains()`
 
-`push_swap_front()` and `swap_pop_front()` are `O(1)` in every call (not just amortized), at the
-cost of not preserving the order of the other elements.
+`push_swap_front()` never moves elements to make room at the front: without free space there, the
+new element takes the first place and the element there moves to the back. So the order of the
+other elements is not preserved. `swap_pop_front()` is the same as `pop_front()`, which is now
+`O(1)` in every call.
 
 `sort_unstable()` and `sort_unstable_by()` may reorder equal elements, but are ~1.5x faster and
 allocate nothing. For numbers, and other types whose equal elements are indistinguishable, the
@@ -132,21 +134,29 @@ untrusted data as `HashMap` keys.
 
 ## Performance
 
-`EnhVec` keeps the front of the data in a "head" buffer and the rest in a "main" Vec. The head
-holds its elements in their normal order, with free space before and after them, so it grows at
-both ends. Pushes and pops at both ends are amortized `O(1)` like with `VecDeque`: `pop()`
-continues at the back of the head once main is empty, and when `pop_front()` empties the head,
-half of main is moved over. Sorting works on a single contiguous Vec, and a known sort order makes
-e.g. re-sorting, `median()` and `range()` `O(1)`.
+`EnhVec` keeps its elements in order in one buffer, with free space before and after them, so it
+grows at both ends. Pushes at both ends are amortized `O(1)` like with `VecDeque`, and pops at
+both ends are `O(1)`. When one end runs out of space, the elements are moved back towards the
+middle if the buffer is at most half full, or else the buffer grows: 2x at the back like a Vec,
+and 8x/4x/2x (tapering with size) at the front, where each growth moves all elements.
 
-Inserts in the middle rebalance head and main when needed, so that like with `VecDeque` they
-shift at most about half of the elements. In the head, they shift the shorter side.
+Unlike with `VecDeque`, the elements are always one contiguous slice. Indexing costs about the
+same as with a Vec, sorting and order statistics work on the slice directly, and `From<Vec<T>>`
+and `into_vec()` reuse the buffer (`into_vec()` moves the elements to its start if needed). A
+known sort order makes e.g. re-sorting, `median()` and `range()` `O(1)`.
 
-`benches/vs_std.rs` compares it to `Vec` and `VecDeque` on common operations. Roughly: pushes,
-pops, queues and sorted inserts are on par with `VecDeque` (often faster). Random indexing is a
-bit slower than both (picking head or main costs an extra load), and `into_vec()` of data pushed
-at both ends must copy it into one new allocation, where `VecDeque` can rearrange in place. Run it
-with e.g. `cargo bench --bench vs_std -- pop_front`.
+Inserts in the middle shift the shorter side, so like with `VecDeque` at most about half of the
+elements. Used as a queue (pushing at one end, popping at the other), the elements drift towards
+one end and are moved back now and then, where `VecDeque` wraps around.
+
+`benches/vs_std.rs` compares it to `Vec` and `VecDeque` on common operations. Roughly: pushes at
+the back are on par with `Vec`, pushes and pops at both ends are 2-10x faster than with `VecDeque`,
+queues 1.1-1.7x faster, and random indexing 1.3-1.6x faster. Indexing and iteration run at `Vec`
+speed on data in the cache, but right after building 1M elements at both ends they are slower
+(~1.25x and ~2x), as the growing buffer touched more memory than the cache holds. Sorted inserts
+are on par with `VecDeque`, and `into_vec()` of data pushed at the front moves it to the start of
+the buffer, which is slower than the rearranging of `VecDeque` (~0.7x at 1M elements). Run it with
+e.g. `cargo bench --bench vs_std -- pop_front`.
 
 ## Type Support
 
@@ -167,6 +177,10 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
+- Unreleased: One buffer for all elements, with free space at both ends
+    - The elements are always one slice: indexing and iteration run at `Vec` speed, `From<Vec<T>>` and `into_vec()` reuse the buffer
+    - Pushes as fast as `Vec::push()`, `O(1)` pops at both ends without moving elements (2-7x faster), faster queues; sorted inserts ~20% slower, as one buffer shifts more elements than two
+    - `swap_pop_front()` is the same as `pop_front()`, `push_swap_front()` moves the first element to the back when there is no free space at the front
 - 0.5.4: Head in normal order, with free space at both ends
     - Faster sorted inserts, `push_swap_front()` and indexing, `pop()` needs no refill, the head grows 8x/4x/2x as it gets larger
     - `benches/vs_std.rs` keeps freed memory in the process (glibc), so that it measures the containers instead of page faults

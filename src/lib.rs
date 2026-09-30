@@ -6,8 +6,8 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::{self, Debug, Formatter},
     hash::{Hash, Hasher},
-    iter::{Chain, FusedIterator, Sum},
-    mem::{self, MaybeUninit},
+    iter::{FusedIterator, Sum},
+    mem::{self, ManuallyDrop, MaybeUninit},
     ops::{Add, Div, Index, IndexMut, Mul, Sub},
     ptr,
     slice::{self, Iter, IterMut},
@@ -15,20 +15,14 @@ use std::{
 
 /// The default size cutoff for linear/binary search.
 const SEARCH_SIZE_CUTOFF: usize = 32;
-/// Head size beyond which `push_swap_front()` swaps elements around instead of just pushing.
-const HEAD_SIZE: usize = 16;
-/// Capacity of a head buffer when it is first allocated.
-const HEAD_MIN_CAP: usize = 8;
-/// Head buffer size (in bytes) below which it grows 8x, see `head_growth()`.
-const HEAD_GROW_8X: usize = 128 * 1024;
-/// Head buffer size (in bytes) below which it grows 4x, see `head_growth()`.
-const HEAD_GROW_4X: usize = 4 * 1024 * 1024;
-/**
-Size (in bytes) of a main Vec from which growing it in place beats moving it
-into a fresh allocation, see `benches/vec_insert.rs`. Above roughly this size
-allocators (e.g. glibc) typically remap pages on realloc instead of copying.
-*/
-const LARGE_VEC_BYTES: usize = 128 * 1024;
+/// Length up to which `push_swap_front()` just pushes, see there.
+const SWAP_FRONT_LEN: usize = 16;
+/// Capacity of a buffer when it is first allocated.
+const MIN_CAP: usize = 8;
+/// Buffer size (in bytes) below which it grows 8x at the front, see `growth()`.
+const GROW_8X: usize = 128 * 1024;
+/// Buffer size (in bytes) below which it grows 4x at the front, see `growth()`.
+const GROW_4X: usize = 4 * 1024 * 1024;
 /// Number of independent partial sums in `lane_sum()`.
 const SUM_LANES: usize = 8;
 
@@ -74,30 +68,64 @@ impl SortState {
 /* --------------------------------- */
 
 /**
-The front part of an [EnhVecInner]: elements in their normal order, with
+The storage of an [EnhVecInner]: the elements in order in one buffer, with
 free space before and after them. Both ends grow in place until that side
 runs out of space. Then the elements are moved back towards the middle if
 the buffer is at most half full, or else into a larger buffer (see
-`head_growth()`), so that pushes at either end are amortized `O(1)`.
+`make_room()`), so that pushes at either end are amortized `O(1)`. Pops at
+either end are `O(1)`, and the elements are always one slice.
 
 A [Vec] cannot have free space before its first element, so this manages
 its own buffer, where exactly `buf[start..end]` are initialized. It is a
 Vec of MaybeUninit slots, all of them "in use" (its length is our capacity),
-so that it grows with `realloc()` like any Vec (see `make_room()`).
+so that it grows with `realloc()` like any Vec, and converts from and to a
+Vec without copying.
 */
-struct HeadBuf<T> {
+struct DeBuf<T> {
     buf: Vec<MaybeUninit<T>>,
     start: usize,
     end: usize,
 }
 
-impl<T> HeadBuf<T> {
+impl<T> DeBuf<T> {
     fn new() -> Self {
+        Self::from_vec(Vec::new())
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self::from_vec(Vec::with_capacity(capacity))
+    }
+
+    /// Take over the buffer of `v`, its free space at the back. `O(1)`.
+    fn from_vec(v: Vec<T>) -> Self {
+        let mut v: ManuallyDrop<Vec<T>> = ManuallyDrop::new(v);
+        let (len, cap): (usize, usize) = (v.len(), v.capacity());
+        // SAFETY: the same allocation, as MaybeUninit<T> has the layout of T,
+        // and any slot is a valid MaybeUninit
+        let buf: Vec<MaybeUninit<T>> =
+            unsafe { Vec::from_raw_parts(v.as_mut_ptr().cast(), cap, cap) };
         Self {
-            buf: Vec::new(),
+            buf,
             start: 0,
-            end: 0,
+            end: len,
         }
+    }
+
+    /// The elements as a Vec in the same buffer. `O(1)` if there is no free
+    /// space before them, else they are moved to the start first.
+    fn into_vec(mut self) -> Vec<T> {
+        let len: usize = self.len();
+        if self.start > 0 {
+            let base: *mut T = self.buf.as_mut_ptr().cast();
+            // SAFETY: moves the initialized elements within the buffer (may overlap)
+            unsafe { ptr::copy(base.add(self.start), base, len) };
+        }
+        // nothing is left for our drop()
+        let mut buf: ManuallyDrop<Vec<MaybeUninit<T>>> =
+            ManuallyDrop::new(mem::take(&mut self.buf));
+        (self.start, self.end) = (0, 0);
+        // SAFETY: the reverse of from_vec(), with buf[..len] initialized
+        unsafe { Vec::from_raw_parts(buf.as_mut_ptr().cast(), len, buf.capacity()) }
     }
 
     #[inline]
@@ -123,75 +151,83 @@ impl<T> HeadBuf<T> {
         unsafe { slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(self.start).cast(), len) }
     }
 
+    /*
+    The pushes read their end once, like Vec::push(). The element could be
+    stored over our fields as far as the compiler knows, so reading the end
+    again after storing the element waits for that store: ~2.5x slower
+    pushes in `benches/vs_std.rs`.
+    */
     #[inline]
     fn push_front(&mut self, element: T) {
-        if self.start == 0 {
+        let mut start: usize = self.start;
+        if start == 0 {
             self.make_room(1, true);
+            start = self.start;
         }
-        self.start -= 1;
+        start -= 1;
         // SAFETY: start was > 0 and <= buf.len(), and nothing can panic in between
-        unsafe { self.buf.get_unchecked_mut(self.start).write(element) };
+        unsafe { self.buf.get_unchecked_mut(start).write(element) };
+        self.start = start;
     }
 
+    #[inline]
     fn push_back(&mut self, element: T) {
-        if self.end == self.buf.len() {
+        let mut end: usize = self.end;
+        if end == self.buf.len() {
             self.make_room(1, false);
+            end = self.end;
         }
-        self.buf[self.end].write(element);
-        self.end += 1;
+        // SAFETY: end < buf.len(), and nothing can panic in between
+        unsafe { self.buf.get_unchecked_mut(end).write(element) };
+        self.end = end + 1;
     }
 
-    /// Move the first `k` elements of `v` to the back.
-    fn take_front_of(&mut self, v: &mut Vec<T>, k: usize) {
-        assert!(k <= v.len(), "take_front_of() beyond the end");
-        if self.buf.len() - self.end < k {
-            self.make_room(k, false);
-        }
-        let rest: usize = v.len() - k;
-        let dst: *mut T = self.buf.as_mut_ptr().cast();
-        // SAFETY: the k elements move to free slots at our back, and the rest
-        // of `v` to its front. Nothing can panic before both lengths are set.
-        unsafe {
-            let src: *mut T = v.as_mut_ptr();
-            ptr::copy_nonoverlapping(src, dst.add(self.end), k);
-            ptr::copy(src.add(k), src, rest);
-            v.set_len(rest);
-        }
-        self.end += k;
-    }
-
+    #[inline]
     fn pop_front(&mut self) -> Option<T> {
         if self.is_empty() {
             return None;
         }
         self.start += 1;
         // SAFETY: the slot was initialized, and is now outside buf[start..end]
-        Some(unsafe { self.buf[self.start - 1].assume_init_read() })
+        Some(unsafe { self.buf.get_unchecked(self.start - 1).assume_init_read() })
     }
 
+    #[inline]
     fn pop_back(&mut self) -> Option<T> {
         if self.is_empty() {
             return None;
         }
         self.end -= 1;
         // SAFETY: the slot was initialized, and is now outside buf[start..end]
-        Some(unsafe { self.buf[self.end].assume_init_read() })
+        Some(unsafe { self.buf.get_unchecked(self.end).assume_init_read() })
     }
 
-    /**
-    Remove the last `k` elements and return them in order. They are removed
-    up front, so any that the iterator is dropped without yielding are
-    leaked, not dropped (all callers consume it fully).
-    */
-    fn drain_back(
-        &mut self,
-        k: usize,
-    ) -> impl DoubleEndedIterator<Item = T> + ExactSizeIterator + '_ {
-        assert!(k <= self.len(), "drain_back() beyond the start");
-        self.end -= k;
-        // SAFETY: each slot was initialized, is now outside buf[start..end], and is read once
-        let read = |slot: &MaybeUninit<T>| unsafe { slot.assume_init_read() };
-        self.buf[self.end..self.end + k].iter().map(read)
+    /// Make sure that `n` more elements fit at the back.
+    fn reserve_back(&mut self, n: usize) {
+        if self.buf.len() - self.end < n {
+            self.make_room(n, false);
+        }
+    }
+
+    /// Push the elements of `iter` to the back.
+    fn extend(&mut self, iter: impl IntoIterator<Item = T>) {
+        let iter = iter.into_iter();
+        self.reserve_back(iter.size_hint().0);
+        iter.for_each(|x: T| self.push_back(x));
+    }
+
+    /// Move all elements of `other` to the back, leaving it empty.
+    fn append(&mut self, other: &mut Self) {
+        let n: usize = other.len();
+        self.reserve_back(n);
+        // SAFETY: the n elements move out of `other` (a different buffer) to
+        // free slots at our back. Nothing can panic before both ends are set.
+        unsafe {
+            let dst: *mut T = self.buf.as_mut_ptr().add(self.end).cast();
+            ptr::copy_nonoverlapping(other.as_slice().as_ptr(), dst, n);
+        }
+        other.end = other.start;
+        self.end += n;
     }
 
     /// Insert at `index`, moving the shorter part of the elements, those
@@ -225,77 +261,68 @@ impl<T> HeadBuf<T> {
 
     /**
     Make room for `n` more elements at the front (or back). If the buffer is
-    then at most half full, the elements are moved within it, else into a
-    buffer of at least double the size. The other side keeps its free space,
-    up to half of the total, and this side gets the rest: at least about as
-    much as there are elements, which keeps the pushes amortized `O(1)`. An
-    empty buffer is centered instead.
+    then at most half full, the elements are moved within it, else it grows
+    (see `growth()`). The other side keeps its free space, up to half of the
+    total, and this side gets the rest: at least about as much as there are
+    elements, which keeps the pushes amortized `O(1)`. An empty buffer is
+    centered for the front, and starts at its start for the back, like a Vec.
 
     The buffer grows like a Vec, with `realloc()`, which often avoids the
     copy (growing in place, or remapping the pages of a large buffer), and
-    the elements are then moved within it. Copying them straight into a
-    new buffer instead would copy less when `realloc()` has to move, but a
-    new buffer allocated while the old one still exists often keeps the
-    allocator from reusing the memory: page faults on every build-up (8 ms
-    instead of 0.7 ms for 1M `push_front()`s).
+    the elements are then moved within it if needed. Copying them straight
+    into a new buffer instead would copy less when `realloc()` has to move,
+    but a new buffer allocated while the old one still exists often keeps
+    the allocator from reusing the memory: page faults on every build-up
+    (8 ms instead of 0.7 ms for 1M `push_front()`s).
     */
     #[cold]
     fn make_room(&mut self, n: usize, front: bool) {
         let (len, cap): (usize, usize) = (self.len(), self.buf.len());
-        let needed: usize = (len + n).saturating_mul(2);
-        let new_cap: usize = match needed <= cap {
-            true => cap,
-            false => needed.max(head_growth::<T>(cap)).max(HEAD_MIN_CAP),
-        };
-
-        let free: usize = new_cap - len;
-        let other_free: usize = if front { cap - self.end } else { self.start };
-        let keep: usize = match len {
-            0 => free / 2,
-            _ => other_free.min(free / 2),
-        };
-        let new_start: usize = if front { free - keep } else { keep };
-
-        if new_cap > cap {
+        let required: usize = len.checked_add(n).expect("capacity overflow");
+        if required.saturating_mul(2) > cap {
+            let new_cap: usize = required.max(growth::<T>(cap, front)).max(MIN_CAP);
             // realloc() keeps the elements at their positions
             self.buf.reserve_exact(new_cap - cap);
             // SAFETY: MaybeUninit slots need no initialization
-            unsafe { self.buf.set_len(new_cap) };
+            unsafe { self.buf.set_len(self.buf.capacity()) };
         }
-        let base: *mut T = self.buf.as_mut_ptr().cast();
-        // SAFETY: moves the initialized elements within the buffer (may overlap)
-        unsafe { ptr::copy(base.add(self.start), base.add(new_start), len) };
+
+        let free: usize = self.buf.len() - len;
+        // the free space at the other end, before growing
+        let other_free: usize = if front { cap - self.end } else { self.start };
+        let keep: usize = match (len, front) {
+            (0, true) => free / 2,
+            (0, false) => 0,
+            _ => other_free.min(free / 2),
+        };
+        // this side gets at least `n`
+        let keep: usize = keep.min(free - n);
+        let new_start: usize = if front { free - keep } else { keep };
+        if new_start != self.start {
+            let base: *mut T = self.buf.as_mut_ptr().cast();
+            // SAFETY: moves the initialized elements within the buffer (may overlap)
+            unsafe { ptr::copy(base.add(self.start), base.add(new_start), len) };
+        }
         self.start = new_start;
         self.end = new_start + len;
     }
 }
 
-impl<T> Drop for HeadBuf<T> {
+impl<T> Drop for DeBuf<T> {
     fn drop(&mut self) {
         // SAFETY: buf[start..end] are initialized, and are dropped only here
         unsafe { ptr::drop_in_place(self.as_mut_slice()) }
     }
 }
 
-impl<T: Clone> Clone for HeadBuf<T> {
+impl<T: Clone> Clone for DeBuf<T> {
+    /// Like a Vec, the clone has only room for the elements.
     fn clone(&self) -> Self {
-        let mut buf: Vec<MaybeUninit<T>> = Vec::with_capacity(self.buf.len());
-        // SAFETY: MaybeUninit slots need no initialization
-        unsafe { buf.set_len(self.buf.len()) };
-        let mut head: Self = Self {
-            buf,
-            start: self.start,
-            end: self.start,
-        };
-        // one at a time, so that a panicking clone() leaves a valid head to drop
-        self.as_slice()
-            .iter()
-            .for_each(|x: &T| head.push_back(x.clone()));
-        head
+        Self::from_vec(self.as_slice().to_vec())
     }
 }
 
-impl<T: Debug> Debug for HeadBuf<T> {
+impl<T: Debug> Debug for DeBuf<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.as_slice()).finish()
     }
@@ -307,8 +334,7 @@ impl<T: Debug> Debug for HeadBuf<T> {
 #[derive(Debug, Clone)]
 struct EnhVecInner<T> {
     state: SortState,
-    head: HeadBuf<T>,
-    main: Vec<T>,
+    buf: DeBuf<T>,
 }
 
 impl<T> EnhVecInner<T> {
@@ -317,41 +343,50 @@ impl<T> EnhVecInner<T> {
         F: FnMut(&T, &T) -> Ordering,
     {
         self.set_changed(); // cannot know what `f` does to the order
-        self.compact();
         match stable {
-            true => self.main.sort_by(f),
-            false => self.main.sort_unstable_by(f),
+            true => self.as_mut_slice().sort_by(f),
+            false => self.as_mut_slice().sort_unstable_by(f),
         }
     }
 
     fn new() -> Self {
         Self {
             state: SortState::Unsorted,
-            head: HeadBuf::new(),
-            main: Vec::new(),
+            buf: DeBuf::new(),
         }
     }
 
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            main: Vec::with_capacity(capacity),
+            buf: DeBuf::with_capacity(capacity),
             ..Self::new()
         }
     }
 
+    #[inline]
+    fn as_slice(&self) -> &[T] {
+        self.buf.as_slice()
+    }
+
+    /// The elements as a mutable slice. NOTE: does not update the sort state.
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        self.buf.as_mut_slice()
+    }
+
     fn len(&self) -> usize {
-        self.main.len() + self.head.len()
+        self.buf.len()
     }
 
     fn is_empty(&self) -> bool {
-        self.head.is_empty() && self.main.is_empty()
+        self.buf.is_empty()
     }
 
     fn first(&self) -> Option<&T> {
-        self.head.as_slice().first().or_else(|| self.main.first())
+        self.as_slice().first()
     }
     fn last(&self) -> Option<&T> {
-        self.main.last().or_else(|| self.head.as_slice().last())
+        self.as_slice().last()
     }
 
     /// Set the internal sorting state to "changed".
@@ -361,71 +396,36 @@ impl<T> EnhVecInner<T> {
     }
 
     /**
-    Constant time push to the front of [EnhVecInner]. This method attempts
-    to maintain a semblance of order by swapping elements within the head
-    and between the head and main Vecs. Specifically, it moves the last
-    element of the head to the main Vec, puts the new element first in the
-    head, and performs swaps to keep the head partially ordered.
+    Constant time push to the front of [EnhVecInner]. With free space at the
+    front, or only a few elements to move, this is `push_front()`. Otherwise
+    the new element takes the first place, and the one there is pushed to
+    the back, so that no elements are moved to make room at the front.
     */
     fn push_swap_front(&mut self, element: T) {
-        let head_len: usize = self.head.len();
-        if head_len < HEAD_SIZE {
-            // if the head is not full, just push to it
-            self.head.push_front(element);
+        if self.buf.start > 0 || self.len() <= SWAP_FRONT_LEN {
+            self.buf.push_front(element);
         } else {
-            // the new element replaces the first one, which replaces the last
-            // one, which moves to the end of main
-            let main_last: usize = self.main.len(); // len() - 1 after push()
-            let head: &mut [T] = self.head.as_mut_slice();
-            let first: T = mem::replace(&mut head[0], element);
-            let last: T = mem::replace(&mut head[head_len - 1], first);
-            head.swap(1, head_len - 1);
-            self.main.push(last);
-            if main_last > 0 {
-                self.main.swap(0, main_last);
-            }
+            let first: T = mem::replace(&mut self.as_mut_slice()[0], element);
+            self.buf.push_back(first);
         }
         self.set_changed();
     }
 
-    /// Pop from the back of main, or once main is empty, from the back of the
-    /// head, which needs no moving since the head grows at both ends.
+    #[inline]
     fn pop(&mut self) -> Option<T> {
-        self.main.pop().or_else(|| self.head.pop_back())
+        self.buf.pop_back()
     }
 
-    /**
-    Pop from the front of the head. If the head is empty, the front half of
-    main is moved over first, so that any mix of pops from both ends stays
-    amortized `O(1)` (each move is paid for by the pops it enables).
-    */
+    #[inline]
     fn pop_front(&mut self) -> Option<T> {
-        if self.head.is_empty() && !self.main.is_empty() {
-            let k: usize = self.main.len().div_ceil(2);
-            self.head.take_front_of(&mut self.main, k);
-        }
-        self.head.pop_front()
-    }
-
-    /// Like `pop_front()`, but swap-removes from an unsorted main Vec.
-    fn swap_pop_front(&mut self) -> Option<T> {
-        if self.head.is_empty() && !self.main.is_empty() && self.state.is_unsorted() {
-            // no known order to maintain, so we can just swap-remove
-            return Some(self.main.swap_remove(0));
-        }
-        // removing the first element of a sorted Vec does not
-        // change the ordering, so we can just remove it
-        self.pop_front()
+        self.buf.pop_front()
     }
 
     /**
     Reverse the order of the elements in place and set state accordingly.
-    The logical order is `head ++ main`, so the reverse is `rev(main) ++ rev(head)`.
     */
     fn reverse(&mut self) {
-        let head_len: usize = self.head.len();
-        self.main.reverse();
-        self.main.extend(self.head.drain_back(head_len).rev());
+        self.as_mut_slice().reverse();
         if self.state.is_sorted() {
             self.state.reverse();
         } else {
@@ -433,53 +433,13 @@ impl<T> EnhVecInner<T> {
         }
     }
 
-    /**
-    Fold the head elements into the main Vec. The order of the elements is
-    preserved. If the head is empty, this is a no-op.
-
-    Tries to minimize computational complexity (see `benches/vec_insert.rs`):
-    - with enough spare capacity, main is shifted once, in place
-    - else for small main, a new Vec is allocated and elements are moved to it,
-      as growing in place would copy main twice (realloc + shift)
-    - else main is grown and shifted in place, as large reallocations are cheap
-
-    Only as much capacity is added as needed (the existing one is kept), as
-    compaction happens before sorting, `into_vec()` etc., not on pushes.
-    */
-    fn compact(&mut self) {
-        let head_len: usize = self.head.len();
-        if head_len == 0 {
-            return;
-        }
-
-        let main_len: usize = self.main.len();
-        let fits: bool = self.main.capacity() - main_len >= head_len;
-        if fits || main_len * size_of::<T>() >= LARGE_VEC_BYTES {
-            // splice() would otherwise grow like Vec::reserve(), up to doubling
-            self.main.reserve_exact(head_len);
-            self.main.splice(0..0, self.head.drain_back(head_len));
-        } else {
-            let capacity: usize = (main_len + head_len).max(self.main.capacity());
-            let mut tmp: Vec<T> = Vec::with_capacity(capacity);
-            tmp.extend(self.head.drain_back(head_len));
-            tmp.append(&mut self.main);
-            self.main = tmp;
-        }
-        if self.state.is_unsorted() {
-            self.set_changed();
-        }
+    // Internal iterators over the elements.
+    fn internal_iter(&'_ self) -> Iter<'_, T> {
+        self.as_slice().iter()
     }
-
-    // Internal iterators combining the head and main [Vec]s.
-    fn internal_iter(&'_ self) -> Chain<Iter<'_, T>, Iter<'_, T>> {
-        self.head.as_slice().iter().chain(self.main.iter())
-    }
-    fn internal_iter_mut(&'_ mut self) -> Chain<IterMut<'_, T>, IterMut<'_, T>> {
+    fn internal_iter_mut(&'_ mut self) -> IterMut<'_, T> {
         self.set_changed(); // order of elements could change
-        self.head
-            .as_mut_slice()
-            .iter_mut()
-            .chain(self.main.iter_mut())
+        self.as_mut_slice().iter_mut()
     }
 
     /// The sum of `f(x)` over all elements, in any order (see `lane_sum()`).
@@ -487,56 +447,18 @@ impl<T> EnhVecInner<T> {
     where
         T: Copy,
     {
-        lane_sum(self.head.as_slice(), &f) + lane_sum(&self.main, &f)
-    }
-
-    /**
-    Even out head and main when one holds less than a quarter of what the
-    other does, by moving elements over at the junction. An insert then
-    shifts at most about half of the elements, like VecDeque shifting its
-    shorter side: in the head the shorter part before or after the position,
-    in main those after it. The moves are amortized over the inserts.
-    */
-    fn balance(&mut self) {
-        let (head_len, main_len): (usize, usize) = (self.head.len(), self.main.len());
-        if 4 * head_len < main_len {
-            // the front of main continues at the back of the head
-            let k: usize = (main_len - head_len) / 2;
-            self.head.take_front_of(&mut self.main, k);
-        } else if 4 * main_len < head_len {
-            let k: usize = (head_len - main_len) / 2;
-            self.main.splice(0..0, self.head.drain_back(k));
-        }
-    }
-
-    /**
-    Whether logical `index` is in the head, and its position there. Written
-    so that head or main is picked with a conditional move instead of a
-    jump, which the CPU would mispredict when reads hit head and main at
-    random. An out of bounds position is caught by the slice indexing.
-    */
-    #[inline]
-    fn locate(&self, index: usize) -> (bool, usize) {
-        let head_len: usize = self.head.len();
-        let in_head: bool = index < head_len;
-        let main_pos: usize = index.wrapping_sub(head_len);
-        (in_head, if in_head { index } else { main_pos })
+        lane_sum(self.as_slice(), f)
     }
 
     fn get(&self, index: usize) -> Option<&T> {
-        if index >= self.len() {
-            None
-        } else {
-            Some(&self[index])
-        }
+        self.as_slice().get(index)
     }
 
     fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        if index >= self.len() {
-            None
-        } else {
-            Some(&mut self[index])
-        }
+        let element: &mut T = self.buf.as_mut_slice().get_mut(index)?;
+        // mutation could change the sort order of elements
+        self.state = SortState::Changed;
+        Some(element)
     }
 }
 
@@ -546,29 +468,19 @@ impl<T> EnhVecInner<T> {
 impl<T> Index<usize> for EnhVecInner<T> {
     type Output = T;
 
+    #[inline]
     fn index(&self, index: usize) -> &Self::Output {
-        let (in_head, i): (bool, usize) = self.locate(index);
-        let slice: &[T] = if in_head {
-            self.head.as_slice()
-        } else {
-            &self.main
-        };
-        &slice[i]
+        &self.as_slice()[index]
     }
 }
 
 // Allow mutable indexing into EnhVecInner
 impl<T> IndexMut<usize> for EnhVecInner<T> {
+    #[inline]
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         // mutation could change the sort order of elements
         self.set_changed();
-        let (in_head, i): (bool, usize) = self.locate(index);
-        let slice: &mut [T] = if in_head {
-            self.head.as_mut_slice()
-        } else {
-            &mut self.main
-        };
-        &mut slice[i]
+        &mut self.as_mut_slice()[index]
     }
 }
 
@@ -604,92 +516,73 @@ impl<T: PartialOrd> EnhVecInner<T> {
             return false;
         }
 
-        /*
-        Check the slices directly, which is several times faster than zipping
-        the chained iterators, with the direction decided outside the loops so
-        they can be vectorized.
-        */
-        let (head, main): (&[T], &[T]) = (self.head.as_slice(), &self.main);
-        let junction: bool = match (head.last(), main.first()) {
-            (Some(h), Some(m)) => in_order(h, m),
-            _ => true,
-        };
-        let desc_order = |a: &T, b: &T| a >= b;
-        junction
-            && match desc {
-                false => head.is_sorted() && main.is_sorted(),
-                true => head.is_sorted_by(desc_order) && main.is_sorted_by(desc_order),
-            }
+        // the direction is decided outside the loops, so they can be vectorized
+        match desc {
+            false => self.as_slice().is_sorted(),
+            true => self.as_slice().is_sorted_by(|a: &T, b: &T| a >= b),
+        }
     }
 
-    /// Inserts into the head or main Vec, depending on the index.
+    /// Insert at `idx`, moving the shorter part of the elements, see [DeBuf].
     fn insert(&mut self, idx: usize, element: T) {
-        self.balance();
-        let head_len: usize = self.head.len();
-        if idx <= head_len {
-            // at the junction, the back of the head is the cheaper end
-            self.head.insert(idx, element);
-        } else {
-            // insert into the main Vec
-            self.main.insert(idx - head_len, element);
-        }
+        self.buf.insert(idx, element);
         if self.order_changed(idx) {
             self.set_changed();
         }
     }
 
-    fn push(&mut self, element: T) {
-        self.main.push(element);
-        // nothing to check once the order is known to have changed
-        if self.state != SortState::Changed && self.order_changed(self.len() - 1) {
-            self.set_changed();
-        }
-    }
-
-    fn push_front(&mut self, element: T) {
-        self.head.push_front(element);
-        if self.state != SortState::Changed && self.order_changed(0) {
-            self.set_changed();
-        }
-    }
-
-    /// Check whether an element addition changed the sort ordering.
     #[inline]
-    fn order_changed(&self, idx: usize) -> bool {
-        if self.len() == 1 {
-            return false;
+    fn push(&mut self, element: T) {
+        self.buf.push_back(element);
+        // nothing to check once the order is known to have changed
+        if self.state != SortState::Changed {
+            if let [.., a, b] = self.as_slice() {
+                if self.out_of_order(a, b) {
+                    self.set_changed();
+                }
+            }
         }
+    }
 
+    #[inline]
+    fn push_front(&mut self, element: T) {
+        self.buf.push_front(element);
+        if self.state != SortState::Changed {
+            if let [a, b, ..] = self.as_slice() {
+                if self.out_of_order(a, b) {
+                    self.set_changed();
+                }
+            }
+        }
+    }
+
+    /// Check whether an element addition at `idx` changed the sort ordering.
+    fn order_changed(&self, idx: usize) -> bool {
+        let elements: &[T] = self.as_slice();
+        let x: &T = &elements[idx];
+        let after_prev: bool = idx > 0 && self.out_of_order(&elements[idx - 1], x);
+        let before_next = |next: &T| self.out_of_order(x, next);
+        after_prev || elements.get(idx + 1).is_some_and(before_next)
+    }
+
+    /**
+    Whether neighbors `a` and `b` break the known sort order. For unsorted
+    data any addition counts as a change, and once changed, nothing does.
+    */
+    #[inline]
+    fn out_of_order(&self, a: &T, b: &T) -> bool {
         match self.state {
             SortState::Unsorted => true,
             SortState::Changed => false,
-            SortState::Asc => {
-                if idx == 0 {
-                    return self[0] > self[1];
-                }
-                if idx == self.len() - 1 {
-                    return self[idx - 1] > self[idx];
-                }
-                self[idx - 1] > self[idx] || self[idx] > self[idx + 1]
-            }
-            SortState::Desc => {
-                if idx == 0 {
-                    return self[0] < self[1];
-                }
-                if idx == self.len() - 1 {
-                    return self[idx - 1] < self[idx];
-                }
-                self[idx - 1] < self[idx] || self[idx] < self[idx + 1]
-            }
+            SortState::Asc => a > b,
+            SortState::Desc => a < b,
         }
     }
 }
 
 impl<T: Ord> EnhVecInner<T> {
     fn sort(&mut self, sorting: &Sorting, stable: bool) {
-        // compact() keeps the order, so sort_vec() can trust the current state
-        self.compact();
-        sort_vec(&mut self.main, &self.state, sorting, stable);
+        sort_vec(self.buf.as_mut_slice(), &self.state, sorting, stable);
         self.state = match sorting {
             Sorting::Ascending => SortState::Asc,
             Sorting::Descending => SortState::Desc,
@@ -710,23 +603,16 @@ impl<T: Ord> EnhVecInner<T> {
 
         // short circuit some common cases
         if self.last().is_none_or(|last: &T| !before(&element, last)) {
-            self.main.push(element);
+            self.buf.push_back(element);
             return;
         }
         if self.first().is_some_and(|x: &T| !before(x, &element)) {
-            self.head.push_front(element);
+            self.buf.push_front(element);
             return;
         }
 
-        // insert into the side holding the position (see balance())
-        self.balance();
-        if self.main.first().is_none_or(|m: &T| before(&element, m)) {
-            let pos: usize = partition_idx(self.head.as_slice(), |x: &T| !before(&element, x));
-            self.head.insert(pos, element);
-        } else {
-            let pos: usize = partition_idx(&self.main, |x: &T| !before(&element, x));
-            self.main.insert(pos, element);
-        }
+        let pos: usize = partition_idx(self.as_slice(), |x: &T| !before(&element, x));
+        self.buf.insert(pos, element);
     }
 }
 
@@ -734,15 +620,15 @@ impl<T: Ord> EnhVecInner<T> {
 
 impl<T: PartialEq> PartialEq for EnhVecInner<T> {
     fn eq(&self, other: &Self) -> bool {
-        // compare the logical order, not how the elements are split between head and main
-        self.len() == other.len() && self.internal_iter().eq(other.internal_iter())
+        // compare the elements, not where they are in the buffer
+        self.as_slice() == other.as_slice()
     }
 }
 
 impl<T> From<Vec<T>> for EnhVecInner<T> {
     fn from(v: Vec<T>) -> Self {
         Self {
-            main: v,
+            buf: DeBuf::from_vec(v),
             ..Self::new()
         }
     }
@@ -802,7 +688,7 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
     }
 
     /// Insert an element at index. Shifts up to about half of the elements, like
-    /// VecDeque: the head/main split is rebalanced if needed.
+    /// VecDeque: those before or after it, whichever are fewer.
     pub fn insert(&mut self, idx: usize, element: T) {
         self.data.insert(idx, element);
     }
@@ -820,15 +706,16 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
 
     /**
     Insert an element at the start of the [EnhVec], without ever moving more
-    than a few elements: once the head has `HEAD_SIZE` elements, the new one
-    is swapped in and a few others are moved around instead.
+    than a few elements: when there is no free space at the front and more
+    than `SWAP_FRONT_LEN` elements, the new element takes the first place,
+    and the element there is pushed to the back instead.
 
-    - Advantage: every call is `O(1)`, with no occasional larger moves
-      (`push_front()` is `O(1)` only amortized, when a Vec grows).
-    - Limitations: the order of the other elements is not preserved, and on
-      average it is slower than `push_front()` (2.5-5x in
-      `benches/vs_std.rs`). Prefer `push_front()` unless you need the
-      worst-case bound and don't care about the order.
+    - Advantage: no occasional larger moves to make room at the front
+      (`push_front()` is `O(1)` only amortized). Pushing to the back may
+      still grow the buffer, like `Vec::push()`.
+    - Limitations: the order of the other elements is not preserved. Prefer
+      `push_front()` unless you need to avoid those moves and don't care
+      about the order.
     */
     pub fn push_swap_front(&mut self, element: T) {
         self.data.push_swap_front(element);
@@ -921,20 +808,20 @@ impl<T> EnhVec<T> {
     where
         T: Clone,
     {
-        let mut data: Vec<T> = Vec::with_capacity(self.len());
-        data.extend_from_slice(self.data.head.as_slice());
-        data.extend_from_slice(&self.data.main);
-        data
+        self.data.as_slice().to_vec()
     }
 
-    /// Consume the [EnhVec] and return the inner [`Vec<T>`].
-    /// Time complexity: `O(1)` if there is nothing in the head, else `O(N)`.
-    pub fn into_vec(mut self) -> Vec<T> {
-        self.data.compact();
-        self.data.main
+    /**
+    Consume the [EnhVec] and return its elements as a [`Vec<T>`], in the same
+    buffer. Time complexity: `O(1)` if there is no free space before the
+    elements (nothing was pushed or popped at the front), else `O(N)`, as
+    they are moved to the start of the buffer.
+    */
+    pub fn into_vec(self) -> Vec<T> {
+        self.data.buf.into_vec()
     }
 
-    /// Length of the [EnhVec] (the sum of the lengths of the head and main [Vec]s).
+    /// Length of the [EnhVec].
     pub fn len(&self) -> usize {
         self.data.len()
     }
@@ -951,37 +838,24 @@ impl<T> EnhVec<T> {
         self.data.last()
     }
 
-    /**
-    Remove and return the last element. Time complexity: amortized `O(1)`,
-    also mixed with `pop_front()`: when one end runs out, half of the
-    elements are moved over from the other end.
-    */
+    /// Remove and return the last element. Time complexity: `O(1)`.
     pub fn pop(&mut self) -> Option<T> {
         self.data.pop()
     }
 
     /// Remove and return the first element. Order of the remaining elements
-    /// is preserved. Time complexity: amortized `O(1)`, see `pop()`.
+    /// is preserved. Time complexity: `O(1)`, no elements are moved.
     pub fn pop_front(&mut self) -> Option<T> {
         self.data.pop_front()
     }
 
     /**
-    Remove and return the first element, without ever moving more than one
-    element: if the data is not sorted and the head is empty, the last
-    element is swapped into the first place (like `Vec::swap_remove(0)`).
-
-    - Advantage: every call is `O(1)` for unsorted data, with no occasional
-      larger moves (`pop_front()` is `O(1)` only amortized: when the head
-      runs empty, it moves half of the elements over).
-    - Limitations: the order of the remaining elements is not preserved, and
-      on average it is slower than `pop_front()` (1.3-2x in
-      `benches/vs_std.rs`). Sorted data stays sorted, but then this is just
-      `pop_front()`. Prefer `pop_front()` unless you need the worst-case
-      bound and don't care about the order.
+    The same as `pop_front()`, which is now `O(1)` in every call and keeps
+    the order. This used to swap the last element into the first place, to
+    avoid the occasional larger moves of `pop_front()`.
     */
     pub fn swap_pop_front(&mut self) -> Option<T> {
-        self.data.swap_pop_front()
+        self.data.pop_front()
     }
 
     pub fn get(&self, index: usize) -> Option<&T> {
@@ -992,19 +866,17 @@ impl<T> EnhVec<T> {
     }
 
     pub fn iter(&self) -> EnhVecIter<'_, T> {
-        EnhVecIter::new(self.data.head.as_slice(), &self.data.main)
+        EnhVecIter::new(self.data.as_slice())
     }
     pub fn iter_mut(&mut self) -> EnhVecIterMut<'_, T> {
         self.data.set_changed(); // order of elements could change
-        EnhVecIterMut::new(self.data.head.as_mut_slice(), &mut self.data.main)
+        EnhVecIterMut::new(self.data.as_mut_slice())
     }
 
     /// Move all elements from another [EnhVec] into this one. Maintains the
     /// relative order of the elements. The sort state is set to "None".
     pub fn append(&mut self, other: &mut Self){
-        let head_len: usize = other.data.head.len();
-        self.data.main.extend(other.data.head.drain_back(head_len));
-        self.data.main.append(&mut other.data.main);
+        self.data.buf.append(&mut other.data.buf);
         self.data.set_changed();
         self.sort = Sorting::None;
     }
@@ -1371,7 +1243,7 @@ impl<T: PartialEq + PartialOrd> From<Vec<T>> for EnhVec<T> {
 // Extend this EnhVec from an iterator
 impl<T> Extend<T> for EnhVec<T> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        self.data.main.extend(iter);
+        self.data.buf.extend(iter);
         self.data.set_changed();
     }
 }
@@ -1393,22 +1265,19 @@ impl<T: PartialEq + PartialOrd> FromIterator<T> for EnhVec<T> {
 /* ############################### Iterators ############################### */
 
 /**
-An immutable iterator over the elements of the [EnhVec].
-
-This iterator is a combination of the head and main parts, the head in
-front of main. The iterator is not sorted, unless the [EnhVec] is sorted
-before creating this iterator.
+An immutable iterator over the elements of the [EnhVec], in their order.
+The iterator is not sorted, unless the [EnhVec] is sorted before creating
+this iterator.
 */
 #[derive(Debug)]
 pub struct EnhVecIter<'a, T: 'a> {
-    head: Iter<'a, T>,
-    main: Iter<'a, T>,
+    iter: Iter<'a, T>,
 }
 
 impl<'a, T> EnhVecIter<'a, T> {
     #[rustfmt::skip]
-    fn new(head: &'a [T], main: &'a [T]) -> Self {
-        Self { head: head.iter(), main: main.iter() }
+    fn new(elements: &'a [T]) -> Self {
+        Self { iter: elements.iter() }
     }
 }
 
@@ -1416,7 +1285,7 @@ impl<'a, T> EnhVecIter<'a, T> {
 impl<T> Clone for EnhVecIter<'_, T> {
     #[rustfmt::skip]
     fn clone(&self) -> Self {
-        Self { head: self.head.clone(), main: self.main.clone() }
+        Self { iter: self.iter.clone() }
     }
 }
 
@@ -1425,55 +1294,66 @@ impl<T> Clone for EnhVecIter<'_, T> {
 /// A mutable iterator over the elements of the [EnhVec].
 #[derive(Debug)]
 pub struct EnhVecIterMut<'a, T: 'a> {
-    head: IterMut<'a, T>,
-    main: IterMut<'a, T>,
+    iter: IterMut<'a, T>,
 }
 
 impl<'a, T> EnhVecIterMut<'a, T> {
     #[rustfmt::skip]
-    fn new(head: &'a mut [T], main: &'a mut [T]) -> Self {
-        Self { head: head.iter_mut(), main: main.iter_mut() }
+    fn new(elements: &'a mut [T]) -> Self {
+        Self { iter: elements.iter_mut() }
     }
 }
 
 /* --------------------------------- */
 
-/// Common iterator trait impls for [EnhVecIter] and [EnhVecIterMut].
+/// Common iterator trait impls for [EnhVecIter] and [EnhVecIterMut], passed
+/// through to the slice iterators.
 macro_rules! impl_enhvec_iter {
     ($iter:ident, $item:ty) => {
         impl<'a, T> Iterator for $iter<'a, T> {
             type Item = $item;
 
+            #[inline]
             fn next(&mut self) -> Option<Self::Item> {
-                self.head.next().or_else(|| self.main.next())
+                self.iter.next()
             }
 
+            #[inline]
             fn size_hint(&self) -> (usize, Option<usize>) {
-                let len: usize = self.head.len() + self.main.len();
-                (len, Some(len))
+                self.iter.size_hint()
             }
 
-            // separate loops over head and main (like Chain), used by e.g. for_each()
-            fn fold<B, F>(self, init: B, mut f: F) -> B
+            #[inline]
+            fn nth(&mut self, n: usize) -> Option<Self::Item> {
+                self.iter.nth(n)
+            }
+
+            #[inline]
+            fn fold<B, F>(self, init: B, f: F) -> B
             where
                 F: FnMut(B, Self::Item) -> B,
             {
-                let acc: B = self.head.fold(init, &mut f);
-                self.main.fold(acc, f)
+                self.iter.fold(init, f)
             }
         }
 
         impl<'a, T> DoubleEndedIterator for $iter<'a, T> {
+            #[inline]
             fn next_back(&mut self) -> Option<Self::Item> {
-                self.main.next_back().or_else(|| self.head.next_back())
+                self.iter.next_back()
             }
 
-            fn rfold<B, F>(self, init: B, mut f: F) -> B
+            #[inline]
+            fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+                self.iter.nth_back(n)
+            }
+
+            #[inline]
+            fn rfold<B, F>(self, init: B, f: F) -> B
             where
                 F: FnMut(B, Self::Item) -> B,
             {
-                let acc: B = self.main.rfold(init, &mut f);
-                self.head.rfold(acc, f)
+                self.iter.rfold(init, f)
             }
         }
 
@@ -1997,17 +1877,20 @@ fn partition_idx<T>(v: &[T], mut pred: impl FnMut(&T) -> bool) -> usize {
 }
 
 /**
-The capacity a head buffer of `cap` elements grows to. Growing at the front
-moves the elements to the back of the grown buffer, so each growth moves all
-of them, and a larger factor means fewer moves: about 1 per element over
-time with 2x, 1/3 with 4x and 1/7 with 8x. Small buffers grow fast as that
-wastes little memory, tapering down to 2x like Vec. For large buffers the
-unused front is mostly untouched pages, which cost address space only.
+The capacity a buffer of `cap` elements grows to, for a push at the `front`
+or the back. Growing at the front moves the elements to the back of the grown
+buffer, so each growth moves all of them, and a larger factor means fewer
+moves: about 1 per element over time with 2x, 1/3 with 4x and 1/7 with 8x.
+Small buffers grow fast as that wastes little memory, tapering down to 2x.
+For large buffers the unused front is mostly untouched pages, which cost
+address space only. At the back the elements stay where they are, so it
+grows 2x like a Vec.
 */
-fn head_growth<T>(cap: usize) -> usize {
+fn growth<T>(cap: usize, front: bool) -> usize {
     let factor: usize = match cap * size_of::<T>() {
-        bytes if bytes < HEAD_GROW_8X => 8,
-        bytes if bytes < HEAD_GROW_4X => 4,
+        _ if !front => 2,
+        bytes if bytes < GROW_8X => 8,
+        bytes if bytes < GROW_4X => 4,
         _ => 2,
     };
     cap.saturating_mul(factor)
@@ -2227,7 +2110,13 @@ mod tests {
 
         let mut test: Vec<u32> = Vec::from_iter(PI_ARR);
         test.insert(0, XTRA);
-        assert_eq!(ev.to_vec(), test);
+        assert_eq!(ev.to_vec(), test, "few elements: like push_front()");
+
+        // no free space at the front: the first one moves to the back
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(0..100);
+        ev.push_swap_front(XTRA);
+        let test: Vec<u32> = [XTRA].into_iter().chain(1..100).chain([0]).collect();
+        assert_eq!(ev.to_vec(), test, "swapped");
     }
 
     #[test]
@@ -2429,11 +2318,11 @@ mod tests {
     }
 
     #[test]
-    fn test_push_front_compact_desc() {
+    fn test_push_front_keeps_desc() {
         let mut ev: EnhVec<u32> = EnhVec::from_iter([3, 2, 1]);
         ev.sort(Sorting::Descending);
         // every push keeps the DESC order
-        let top: u32 = 4 + HEAD_SIZE as u32;
+        let top: u32 = 4 + SWAP_FRONT_LEN as u32;
         (4..=top).for_each(|x: u32| ev.push_front(x));
 
         let test: Vec<u32> = (1..=top).rev().collect();
@@ -2443,20 +2332,20 @@ mod tests {
 
     #[test]
     #[rustfmt::skip]
-    fn test_insert_into_head() {
+    fn test_insert_near_front() {
         let mut ev: EnhVec<u32> = EnhVec::from_iter([10, 11]);
         ev.push_front(2);
         ev.push_front(1);
         ev.insert(0, 0);
         assert_eq!(ev.to_vec(), vec![0, 1, 2, 10, 11], "insert at front");
         ev.insert(2, XTRA);
-        assert_eq!(ev.to_vec(), vec![0, 1, XTRA, 2, 10, 11], "insert inside head");
+        assert_eq!(ev.to_vec(), vec![0, 1, XTRA, 2, 10, 11], "insert near the front");
         ev.insert(4, XTRA);
-        assert_eq!(ev.to_vec(), vec![0, 1, XTRA, 2, XTRA, 10, 11], "insert at head/main junction");
+        assert_eq!(ev.to_vec(), vec![0, 1, XTRA, 2, XTRA, 10, 11], "insert where the front pushes end");
     }
 
     #[test]
-    fn test_reverse_with_head() {
+    fn test_reverse_with_front_pushes() {
         let mut ev: EnhVec<u32> = EnhVec::from_iter([3, 4]);
         ev.push_front(2);
         ev.push_front(1);
@@ -2465,7 +2354,7 @@ mod tests {
 
         let mut sorted: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
         sorted.sort(Sorting::Ascending);
-        sorted.push_front(0); // keeps ASC order, lands in the head
+        sorted.push_front(0); // keeps ASC order
         sorted.reverse();
         let mut test: Vec<u32> = Vec::from_iter(PI_DESC);
         test.push(0);
@@ -2492,7 +2381,7 @@ mod tests {
     fn test_swap_pop_front() {
         let mut ev: EnhVec<u32> = EnhVec::from_iter([1, 2, 3, 4]);
         assert_eq!(ev.swap_pop_front(), Some(1));
-        assert_eq!(ev.to_vec(), vec![4, 2, 3], "unsorted: last one swapped in");
+        assert_eq!(ev.to_vec(), vec![2, 3, 4], "unsorted: like pop_front()");
 
         let mut ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
         ev.sort(Sorting::Ascending);
@@ -2501,15 +2390,15 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_sorted_head() {
+    fn test_insert_sorted_near_front() {
         let mut ev: EnhVec<u32> = EnhVec::from_iter([7, 9]);
         ev.insert_sorted(5); // new first element
-        ev.insert_sorted(6); // between head and main
+        ev.insert_sorted(6); // between the front pushes and the rest
         ev.insert_sorted(3); // new first element
-        ev.insert_sorted(4); // < main[0], but also < the last head element
+        ev.insert_sorted(4); // shifts the shorter side, the front
         assert_eq!(ev.to_vec(), vec![3, 4, 5, 6, 7, 9]);
 
-        // all elements in the head, main is empty
+        // all elements pushed at the front
         let mut ev: EnhVec<u32> = EnhVec::new();
         ev.push_front(5);
         ev.insert_sorted(3);
@@ -2742,16 +2631,16 @@ mod tests {
             let mut asc: EnhVec<u32> = unsorted.clone();
             asc.sort(Sorting::Ascending);
             check_order_stats(&asc, data, "ASC");
-            asc.push_front(0); // keeps ASC, lands in the head
-            assert!(asc.data.state == SortState::Asc && !asc.data.head.is_empty());
-            check_order_stats(&asc, &[data, &[0]].concat(), "ASC with head");
+            asc.push_front(0); // keeps ASC
+            assert!(asc.data.state == SortState::Asc);
+            check_order_stats(&asc, &[data, &[0]].concat(), "ASC with a front push");
 
             let mut desc: EnhVec<u32> = unsorted.clone();
             desc.sort(Sorting::Descending);
             check_order_stats(&desc, data, "DESC");
-            desc.push_front(XTRA); // keeps DESC, lands in the head
-            assert!(desc.data.state == SortState::Desc && !desc.data.head.is_empty());
-            check_order_stats(&desc, &[data, &[XTRA]].concat(), "DESC with head");
+            desc.push_front(XTRA); // keeps DESC
+            assert!(desc.data.state == SortState::Desc);
+            check_order_stats(&desc, &[data, &[XTRA]].concat(), "DESC with a front push");
         }
     }
 
@@ -2849,7 +2738,7 @@ mod tests {
     fn test_iterators() {
         let mut ev: EnhVec<u32> = EnhVec::from_iter([3, 4, 5]);
         ev.push_front(2);
-        ev.push_front(1); // head [2, 1], main [3, 4, 5]
+        ev.push_front(1); // free space before and after the elements
         let test: Vec<u32> = vec![1, 2, 3, 4, 5];
 
         let rev: Vec<u32> = ev.iter().rev().copied().collect();
@@ -2914,18 +2803,26 @@ mod tests {
 
     #[test]
     #[rustfmt::skip]
-    fn test_compact_capacity() {
+    fn test_vec_conversions_keep_the_buffer() {
         let mut ev: EnhVec<u32> = EnhVec::new_with_capacity(1000);
-        (0..=HEAD_SIZE as u32).for_each(|x: u32| ev.push_front(x));
-        ev.sort(Sorting::Ascending); // folds the head into main
-        assert!(ev.data.head.is_empty(), "head was compacted");
-        let capacity: usize = ev.data.main.capacity();
-        assert!(capacity >= 1000, "main capacity {capacity} kept");
+        let ptr: *const MaybeUninit<u32> = ev.data.buf.buf.as_ptr();
+        (0..1000).for_each(|x: u32| ev.push(x));
+        ev.sort(Sorting::Descending);
+        let v: Vec<u32> = ev.into_vec();
+        assert_eq!((v.as_ptr().cast(), v.capacity()), (ptr, 1000), "no reallocation");
+        assert!(v.iter().copied().eq((0..1000).rev()), "sorted in place");
 
-        let mut ev: EnhVec<u32> = EnhVec::from_iter(0..1000);
-        (0..1000).for_each(|x: u32| ev.push_front(x));
-        let capacity: usize = ev.into_vec().capacity();
-        assert!(capacity < 2100, "into_vec() capacity {capacity} not doubled");
+        let mut ev: EnhVec<u32> = EnhVec::from(v);
+        assert_eq!(ev.data.buf.buf.as_ptr(), ptr, "from a Vec in O(1)");
+        assert_eq!((ev.pop_front(), ev.pop_front()), (Some(999), Some(998)));
+        let v: Vec<u32> = ev.into_vec();
+        assert_eq!((v.as_ptr().cast(), v.capacity()), (ptr, 1000), "moved to the start");
+        assert!(v.iter().copied().eq((0..998).rev()), "moved in order");
+
+        // growing at the front moves the elements, but keeps them in order
+        let mut ev: EnhVec<u32> = EnhVec::from(v);
+        (998..1100).for_each(|x: u32| ev.push_front(x));
+        assert!(ev.into_vec().into_iter().eq((0..1100).rev()), "grown at the front");
     }
 
     #[test]
@@ -2940,7 +2837,7 @@ mod tests {
         let popped: Vec<u32> = from_fn(|| ev.pop()).collect();
         assert_eq!(popped, (0..n).collect::<Vec<u32>>(), "pop() after push_front()");
 
-        // alternate between the ends, which rebalances between head and main
+        // alternate between the ends
         (0..n).for_each(|x: u32| ev.push(x));
         let mut expected: VecDeque<u32> = (0..n).collect();
         for i in 0..n {
@@ -2957,7 +2854,7 @@ mod tests {
         let ev1: EnhVec<u32> = EnhVec::from_iter([1, 2, 3]);
         let mut ev2: EnhVec<u32> = EnhVec::from_iter([2, 3]);
         ev2.push_front(1);
-        assert_eq!(ev1, ev2, "same elements, different head/main split");
+        assert_eq!(ev1, ev2, "same elements, different free space before them");
 
         let set: HashSet<EnhVec<u32>> = HashSet::from([ev1.clone()]);
         assert!(set.contains(&ev2), "usable as a HashSet key");
@@ -3045,7 +2942,7 @@ mod tests {
     #[test]
     fn test_float_sums_all_lanes() {
         let close = |got: Option<f64>, want: f64| got.is_some_and(|x| (x - want).abs() < EPSILON);
-        // lengths around multiples of the lane count, with elements in both head and main
+        // lengths around multiples of the lane count, with elements pushed at both ends
         for n in 0..4 * SUM_LANES {
             let values: Vec<u32> = (0..n as u32).map(|x: u32| x * x % 17).collect();
             let (mut ev, mut fp): (EnhVec<u32>, EnhVec<f64>) = (EnhVec::new(), EnhVec::new());
@@ -3119,7 +3016,7 @@ mod tests {
 
     #[test]
     #[rustfmt::skip]
-    fn test_head_buf_against_vecdeque() {
+    fn test_debuf_against_vecdeque() {
         // deterministic pseudo-random operations (xorshift), checked against a VecDeque
         let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = |bound: usize| -> usize {
@@ -3129,88 +3026,104 @@ mod tests {
             (rng % bound as u64) as usize
         };
         let live: Cell<usize> = Cell::new(0);
-        let mut head: HeadBuf<Counted> = HeadBuf::new();
+        let mut buf: DeBuf<Counted> = DeBuf::new();
         let mut model: VecDeque<usize> = VecDeque::new();
 
         // Miri is several thousand times slower, but finds more
         let steps: usize = if cfg!(miri) { 300 } else { 3000 };
         for step in 0..steps {
             let x: usize = next(1000);
-            match next(10) {
+            match next(11) {
                 0 | 1 => {
-                    head.push_front(Counted::new(x, &live));
+                    buf.push_front(Counted::new(x, &live));
                     model.push_front(x);
                 }
                 2 | 3 => {
-                    head.push_back(Counted::new(x, &live));
+                    buf.push_back(Counted::new(x, &live));
                     model.push_back(x);
                 }
                 4 => {
-                    let popped: Option<usize> = head.pop_front().map(|c: Counted| c.0);
+                    let popped: Option<usize> = buf.pop_front().map(|c: Counted| c.0);
                     assert_eq!(popped, model.pop_front(), "pop_front, step {step}");
                 }
                 5 => {
-                    let popped: Option<usize> = head.pop_back().map(|c: Counted| c.0);
+                    let popped: Option<usize> = buf.pop_back().map(|c: Counted| c.0);
                     assert_eq!(popped, model.pop_back(), "pop_back, step {step}");
                 }
                 6 => {
                     let idx: usize = next(model.len() + 1);
-                    head.insert(idx, Counted::new(x, &live));
+                    buf.insert(idx, Counted::new(x, &live));
                     model.insert(idx, x);
                 }
                 7 => {
-                    let (n, k): (usize, usize) = (next(20), next(20));
-                    let mut v: Vec<Counted> = (x..x + n + k).map(|v: usize| Counted::new(v, &live)).collect();
-                    head.take_front_of(&mut v, n);
-                    model.extend(x..x + n);
-                    assert!(v.iter().map(|c: &Counted| c.0).eq(x + n..x + n + k), "rest of the Vec, step {step}");
+                    // from a buffer with free space at its front
+                    let (k, n): (usize, usize) = (next(5), next(20));
+                    let mut other: DeBuf<Counted> = DeBuf::from_vec((x..x + k + n).map(|v: usize| Counted::new(v, &live)).collect());
+                    (0..k).for_each(|_| drop(other.pop_front()));
+                    buf.append(&mut other);
+                    model.extend(x + k..x + k + n);
+                    assert!(other.is_empty(), "append() empties the other one, step {step}");
                 }
                 8 => {
-                    let k: usize = next(model.len().min(20) + 1);
-                    let drained: Vec<usize> = head.drain_back(k).map(|c: Counted| c.0).collect();
-                    let expected: Vec<usize> = model.split_off(model.len() - k).into();
-                    assert_eq!(drained, expected, "drain_back, step {step}");
+                    let n: usize = next(20);
+                    buf.extend((x..x + n).map(|v: usize| Counted::new(v, &live)));
+                    model.extend(x..x + n);
+                }
+                9 => {
+                    let v: Vec<Counted> = mem::replace(&mut buf, DeBuf::new()).into_vec();
+                    assert!(v.iter().map(|c: &Counted| c.0).eq(model.iter().copied()), "into_vec, step {step}");
+                    buf = DeBuf::from_vec(v);
                 }
                 _ => {
-                    let copy: HeadBuf<Counted> = head.clone();
+                    let copy: DeBuf<Counted> = buf.clone();
                     assert!(copy.as_slice().iter().map(|c: &Counted| c.0).eq(model.iter().copied()));
                 }
             }
-            assert!(head.start <= head.end && head.end <= head.buf.len(), "bounds, step {step}");
-            assert!(head.as_slice().iter().map(|c: &Counted| c.0).eq(model.iter().copied()), "step {step}");
+            assert!(buf.start <= buf.end && buf.end <= buf.buf.len(), "bounds, step {step}");
+            assert!(buf.as_slice().iter().map(|c: &Counted| c.0).eq(model.iter().copied()), "step {step}");
             assert_eq!(live.get(), model.len(), "elements alive, step {step}");
         }
-        drop(head);
+        drop(buf);
         assert_eq!(live.get(), 0, "all dropped");
     }
 
     #[test]
     #[rustfmt::skip]
-    fn test_head_buf_zero_sized() {
-        let mut head: HeadBuf<()> = HeadBuf::new();
-        (0..100).for_each(|_| head.push_front(()));
-        (0..100).for_each(|_| head.push_back(()));
-        head.insert(50, ());
-        head.take_front_of(&mut vec![(); 15], 10);
-        assert_eq!(head.drain_back(20).count(), 20);
-        assert_eq!(head.pop_front(), Some(()));
-        assert_eq!(head.pop_back(), Some(()));
-        assert_eq!(head.len(), 189);
+    fn test_debuf_zero_sized() {
+        let mut buf: DeBuf<()> = DeBuf::new();
+        (0..100).for_each(|_| buf.push_front(()));
+        (0..100).for_each(|_| buf.push_back(()));
+        buf.insert(50, ());
+        buf.append(&mut DeBuf::from_vec(vec![(); 10]));
+        buf.extend([(); 5]);
+        assert_eq!(buf.pop_front(), Some(()));
+        assert_eq!(buf.pop_back(), Some(()));
+        let v: Vec<()> = buf.into_vec();
+        assert_eq!(v.len(), 214);
+        assert_eq!(DeBuf::from_vec(v).clone().len(), 214);
     }
 
     #[test]
     #[rustfmt::skip]
-    fn test_head_layout_through_enhvec() {
-        // the head keeps free space at both ends, so pops from the back reach it directly
+    fn test_layout_through_enhvec() {
+        // free space at both ends, so pops from the back reach the front pushes directly
         let mut ev: EnhVec<u32> = EnhVec::new();
         (0..100).for_each(|x: u32| ev.push_front(x));
-        assert_eq!(ev.pop(), Some(0), "pop() from the back of the head");
-        assert!(ev.data.main.is_empty(), "nothing moved to main");
+        assert_eq!(ev.pop(), Some(0), "pop() from the back");
         let expected: Vec<u32> = (1..100).rev().collect();
-        assert_eq!(format!("{:?}", ev.data.head), format!("{expected:?}"), "Debug in order");
+        assert_eq!(format!("{:?}", ev.data.buf), format!("{expected:?}"), "Debug in order");
 
-        ev.insert(99, 1000); // rebalances first, then goes to the front of main
+        ev.insert(99, 1000); // at the end, so the back side moves
         assert_eq!(ev.last(), Some(&1000));
         assert_eq!(ev.to_vec(), expected.into_iter().chain([1000]).collect::<Vec<u32>>());
+
+        // a queue moves its elements back towards the start instead of growing
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(0..10);
+        for x in 10..10_000 {
+            ev.push(x);
+            assert_eq!(ev.pop_front(), Some(x - 10), "queue, {x}");
+        }
+        let capacity: usize = ev.data.buf.buf.len();
+        assert!(capacity <= 40, "queue capacity {capacity}");
     }
 }

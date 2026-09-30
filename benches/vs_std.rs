@@ -305,7 +305,7 @@ fn pops(c: &mut Criterion) {
 
 /* ============================== access ============================== */
 
-// data built at both ends, so that EnhVec has elements in its head and main Vecs
+// data built at both ends, so that EnhVec has free space before and after its elements
 fn access(c: &mut Criterion) {
     groups(c, "index_random", |g, n| {
         let data: Vec<u64> = random(n, 42);
