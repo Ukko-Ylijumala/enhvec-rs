@@ -5,7 +5,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
-    iter::{Chain, Rev, Sum},
+    iter::{Chain, FusedIterator, Rev, Sum},
     ops::{Add, Div, Index, IndexMut, Mul, Sub},
     slice::{Iter, IterMut},
 };
@@ -696,14 +696,6 @@ impl<T> EnhVec<T> {
         EnhVecIterMut::new(&mut self.data.head, &mut self.data.main)
     }
 
-    /// Extend this [EnhVec] from an iterator.
-    pub fn extend<I>(&mut self, iter: I)
-    where I: IntoIterator<Item = T>,
-    {
-        self.data.main.extend(iter);
-        self.data.set_changed();
-    }
-
     /// Move all elements from another [EnhVec] into this one. Maintains the
     /// relative order of the elements. The sort state is set to "None".
     pub fn append(&mut self, other: &mut Self){
@@ -932,6 +924,21 @@ impl<T: PartialEq + PartialOrd> From<Vec<T>> for EnhVec<T> {
     }
 }
 
+// Extend this EnhVec from an iterator
+impl<T> Extend<T> for EnhVec<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        self.data.main.extend(iter);
+        self.data.set_changed();
+    }
+}
+
+// Extend this EnhVec by copying the elements of an iterator of references, like Vec
+impl<'a, T: Copy + 'a> Extend<&'a T> for EnhVec<T> {
+    fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
+        self.extend(iter.into_iter().copied());
+    }
+}
+
 // Allow `EnhVec::from_iter()` as well as `.collect::<EnhVec<T>>()`
 impl<T: PartialEq + PartialOrd> FromIterator<T> for EnhVec<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
@@ -962,20 +969,13 @@ impl<'a, T> EnhVecIter<'a, T> {
     }
 }
 
-impl<'a, T> Iterator for EnhVecIter<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.head.next().or_else(|| self.main.next())
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len: usize = self.head.len() + self.main.len();
-        (len, Some(len))
+// Implemented by hand, as #[derive(Clone)] would require `T: Clone`
+impl<T> Clone for EnhVecIter<'_, T> {
+    #[rustfmt::skip]
+    fn clone(&self) -> Self {
+        Self { head: self.head.clone(), main: self.main.clone() }
     }
 }
-
-impl<'a, T> ExactSizeIterator for EnhVecIter<'a, T> {}
 
 /* --------------------------------- */
 
@@ -993,20 +993,54 @@ impl<'a, T> EnhVecIterMut<'a, T> {
     }
 }
 
-impl<'a, T> Iterator for EnhVecIterMut<'a, T> {
-    type Item = &'a mut T;
+/* --------------------------------- */
 
-    fn next(&mut self) -> Option<Self::Item> {
-        self.head.next().or_else(|| self.main.next())
-    }
+/// Common iterator trait impls for [EnhVecIter] and [EnhVecIterMut].
+macro_rules! impl_enhvec_iter {
+    ($iter:ident, $item:ty) => {
+        impl<'a, T> Iterator for $iter<'a, T> {
+            type Item = $item;
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len: usize = self.head.len() + self.main.len();
-        (len, Some(len))
-    }
+            fn next(&mut self) -> Option<Self::Item> {
+                self.head.next().or_else(|| self.main.next())
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                let len: usize = self.head.len() + self.main.len();
+                (len, Some(len))
+            }
+
+            // separate loops over head and main (like Chain), used by e.g. for_each()
+            fn fold<B, F>(self, init: B, mut f: F) -> B
+            where
+                F: FnMut(B, Self::Item) -> B,
+            {
+                let acc: B = self.head.fold(init, &mut f);
+                self.main.fold(acc, f)
+            }
+        }
+
+        impl<'a, T> DoubleEndedIterator for $iter<'a, T> {
+            fn next_back(&mut self) -> Option<Self::Item> {
+                self.main.next_back().or_else(|| self.head.next_back())
+            }
+
+            fn rfold<B, F>(self, init: B, mut f: F) -> B
+            where
+                F: FnMut(B, Self::Item) -> B,
+            {
+                let acc: B = self.main.rfold(init, &mut f);
+                self.head.rfold(acc, f)
+            }
+        }
+
+        impl<T> ExactSizeIterator for $iter<'_, T> {}
+        impl<T> FusedIterator for $iter<'_, T> {}
+    };
 }
 
-impl<'a, T> ExactSizeIterator for EnhVecIterMut<'a, T> {}
+impl_enhvec_iter!(EnhVecIter, &'a T);
+impl_enhvec_iter!(EnhVecIterMut, &'a mut T);
 
 /* --------------------------------- */
 
@@ -2272,6 +2306,38 @@ mod tests {
         assert_eq!(ev.average_fp(), Some(f64::INFINITY), "infinite element");
         let ev: EnhVec<f64> = EnhVec::from_iter([1.0, f64::NAN]);
         assert!(ev.average_fp().is_some_and(f64::is_nan), "NaN element");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_iterators() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter([3, 4, 5]);
+        ev.push_front(2);
+        ev.push_front(1); // head [2, 1], main [3, 4, 5]
+        let test: Vec<u32> = vec![1, 2, 3, 4, 5];
+
+        let rev: Vec<u32> = ev.iter().rev().copied().collect();
+        assert_eq!(rev, test.iter().rev().copied().collect::<Vec<u32>>(), "rev()");
+        let mut iter: EnhVecIter<'_, u32> = ev.iter();
+        let ends: [Option<&u32>; 4] = [iter.next(), iter.next_back(), iter.next(), iter.next_back()];
+        assert_eq!(ends, [Some(&1), Some(&5), Some(&2), Some(&4)], "both ends");
+        let rest: EnhVecIter<'_, u32> = iter.clone();
+        assert_eq!(rest.copied().collect::<Vec<u32>>(), vec![3], "clone()");
+        assert_eq!((iter.next(), iter.next(), iter.next_back()), (Some(&3), None, None), "fused");
+
+        assert_eq!(ev.iter().fold(0, |acc: u32, x: &u32| acc * 10 + x), 12345, "fold()");
+        assert_eq!(ev.iter().rfold(0, |acc: u32, x: &u32| acc * 10 + x), 54321, "rfold()");
+        ev.iter_mut().rev().enumerate().for_each(|(i, x): (usize, &mut u32)| *x += i as u32);
+        assert_eq!(ev.to_vec(), vec![5, 5, 5, 5, 5], "iter_mut().rev()");
+    }
+
+    #[test]
+    fn test_extend() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter([1, 2]);
+        ev.extend([3, 4]);
+        ev.extend(&[5, 6]);
+        ev.extend([7].iter());
+        assert_eq!(ev.to_vec(), vec![1, 2, 3, 4, 5, 6, 7]);
     }
 
     #[test]

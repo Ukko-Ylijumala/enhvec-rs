@@ -69,9 +69,10 @@ let unique = vec.distinct(Some(Sorting::Ascending));
 
 - `push()`, `push_front()`, `push_swap_front()`, `insert()`, `insert_sorted()`
 - `pop()`, `pop_front()`, `swap_pop_front()`
-- `extend()`, `extend_sorted()`, `append()`
+- `extend()` (the `Extend` trait, also from `&T` for `Copy` types), `extend_sorted()`, `append()`
 - `reverse()`, `sort()`, `sort_by()`, `is_sorted()`, `as_sorted_asc()`, `as_sorted_desc()`
-- `get()`, `get_mut()`, indexing, `first()`, `last()`, `iter()`, `iter_mut()`, `to_vec()`, `into_vec()`
+- `get()`, `get_mut()`, indexing, `first()`, `last()`, `to_vec()`, `into_vec()`
+- `iter()`, `iter_mut()` (double-ended, e.g. `iter().rev()`), `IntoIterator` for `EnhVec` and its references
 - `for_each()`, `for_each_if()`, `modify_each()`, `modify_each_if()`, `count()`, `contains()`
 
 `push_swap_front()` and `swap_pop_front()` are `O(1)` in every call (not just amortized), at the
@@ -130,6 +131,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - Unreleased
     - `Default` no longer requires `T: Default`, `sort_by()` no longer requires `Ord` (e.g. `sort_by(f64::total_cmp)`)
     - Deterministic `mode()` ties and `distinct()` order, no overflow in `average_fp()`
+    - `Extend` (also from `&T`), double-ended, fused and cloneable iterators
     - Breaking: `range()` is for `Integer` types and returns `None` if the range does not fit, `Integer`/`Float` have new required methods
 - 0.5.0: Correctness and performance pass
     - Fix element order corruption in `compact()`, `insert()`, `reverse()`, `pop_front()` and `insert_sorted()`, and a panic in `insert_sorted()`
