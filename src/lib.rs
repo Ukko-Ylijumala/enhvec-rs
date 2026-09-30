@@ -12,7 +12,7 @@ use std::{
 
 /// The default size cutoff for linear/binary search.
 const SEARCH_SIZE_CUTOFF: usize = 32;
-/// Head size up to which `push_front()` never folds, and `push_swap_front()` swaps beyond.
+/// Head size beyond which `push_swap_front()` swaps elements around instead of just pushing.
 const HEAD_SIZE: usize = 16;
 /**
 Size (in bytes) of a main Vec from which growing it in place beats moving it
@@ -144,22 +144,28 @@ impl<T> EnhVecInner<T> {
         self.set_changed();
     }
 
+    /**
+    Pop from the back of main. If main is empty, the back half of the head
+    is moved over first, so that any mix of pops from both ends stays
+    amortized `O(1)` (each move is paid for by the pops it enables).
+    */
     fn pop(&mut self) -> Option<T> {
-        if self.main.is_empty() {
-            // take over the head in one go, instead of removing head[0] each time
-            self.compact();
+        if self.main.is_empty() && !self.head.is_empty() {
+            // head[..k] are the last k elements, stored reversed
+            let k: usize = self.head.len().div_ceil(2);
+            self.main.extend(self.head.drain(..k).rev());
         }
         self.main.pop()
     }
 
+    /// Pop from the front, i.e. the end of the head. If the head is empty, the
+    /// front half of main is moved over first, like in `pop()`.
     fn pop_front(&mut self) -> Option<T> {
-        self.head.pop().or_else(|| {
-            if self.main.is_empty() {
-                None
-            } else {
-                Some(self.main.remove(0))
-            }
-        })
+        if self.head.is_empty() && !self.main.is_empty() {
+            let k: usize = self.main.len().div_ceil(2);
+            self.head.extend(self.main.drain(..k).rev());
+        }
+        self.head.pop()
     }
 
     /// Like `pop_front()`, but swap-removes from an unsorted main Vec.
@@ -199,6 +205,9 @@ impl<T> EnhVecInner<T> {
     - else for small main, a new Vec is allocated and elements are moved to it,
       as growing in place would copy main twice (realloc + shift)
     - else main is grown and shifted in place, as large reallocations are cheap
+
+    Only as much capacity is added as needed (the existing one is kept), as
+    compaction happens before sorting, `into_vec()` etc., not on pushes.
     */
     fn compact(&mut self) {
         let head_len: usize = self.head.len();
@@ -209,10 +218,11 @@ impl<T> EnhVecInner<T> {
         let main_len: usize = self.main.len();
         let fits: bool = self.main.capacity() - main_len >= head_len;
         if fits || main_len * size_of::<T>() >= LARGE_VEC_BYTES {
+            // splice() would otherwise grow like Vec::reserve(), up to doubling
+            self.main.reserve_exact(head_len);
             self.main.splice(0..0, self.head.drain(..).rev());
         } else {
-            // grow the capacity like Vec::reserve() would, so it is not lost
-            let capacity: usize = (main_len + head_len).max(self.main.capacity() * 2);
+            let capacity: usize = (main_len + head_len).max(self.main.capacity());
             let mut tmp: Vec<T> = Vec::with_capacity(capacity);
             tmp.extend(self.head.drain(..).rev());
             tmp.append(&mut self.main);
@@ -356,10 +366,7 @@ impl<T: PartialOrd> EnhVecInner<T> {
     }
 
     fn push_front(&mut self, element: T) {
-        // fold the head only once it is as large as main: amortized O(1)
-        if self.head.len() >= HEAD_SIZE.max(self.main.len()) {
-            self.compact();
-        }
+        // the head is a reversed Vec, so this is a plain (amortized O(1)) push
         self.head.push(element);
         if self.order_changed(0) {
             self.set_changed();
@@ -537,20 +544,17 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
         self.data.push(element);
     }
 
-    /**
-    Insert an element at the start of the [EnhVec]. Time complexity:
-    amortized `O(1)`. The element goes to the head, which is folded into
-    the main Vec (`O(N)`) only once it has grown as large as the main Vec.
-    */
+    /// Insert an element at the start of the [EnhVec]. Time complexity:
+    /// amortized `O(1)`, like `push()`.
     pub fn push_front(&mut self, element: T) {
         self.data.push_front(element);
     }
 
     /**
-    Insert an element at the start of the [EnhVec]. Unlike `push_front()`,
-    this never folds the head into the main Vec: once the head is full, a few
-    elements are swapped around instead, so the order of the other elements
-    is not preserved. Time complexity: `O(1)`, not just amortized.
+    Insert an element at the start of the [EnhVec], keeping the head small:
+    once it has `HEAD_SIZE` elements, a few elements are swapped around
+    instead, so the order of the other elements is not preserved. Mostly
+    useful with `swap_pop_front()`; `push_front()` is as fast and keeps order.
     */
     pub fn push_swap_front(&mut self, element: T) {
         self.data.push_swap_front(element);
@@ -661,12 +665,17 @@ impl<T> EnhVec<T> {
         self.data.last()
     }
 
+    /**
+    Remove and return the last element. Time complexity: amortized `O(1)`,
+    also mixed with `pop_front()`: when one end runs out, half of the
+    elements are moved over from the other end.
+    */
     pub fn pop(&mut self) -> Option<T> {
         self.data.pop()
     }
 
     /// Remove and return the first element. Order of the remaining elements
-    /// is preserved. Time complexity: `O(1)` from the head, else `O(N)`.
+    /// is preserved. Time complexity: amortized `O(1)`, see `pop()`.
     pub fn pop_front(&mut self) -> Option<T> {
         self.data.pop_front()
     }
@@ -674,8 +683,9 @@ impl<T> EnhVec<T> {
     /**
     Remove and return the first element. The counterpart of `push_swap_front()`:
     if the data is not sorted, the last element may be moved to the front
-    instead of shifting all other elements. Sorted data stays sorted.
-    Time complexity: `O(1)` for unsorted data, else like `pop_front()`.
+    instead of moving half of the elements over like `pop_front()` does at
+    times. Sorted data stays sorted. Time complexity: `O(1)` for unsorted
+    data (not just amortized), else like `pop_front()`.
     */
     pub fn swap_pop_front(&mut self) -> Option<T> {
         self.data.swap_pop_front()
@@ -2069,7 +2079,7 @@ mod tests {
     fn test_push_front_compact_desc() {
         let mut ev: EnhVec<u32> = EnhVec::from_iter([3, 2, 1]);
         ev.sort(Sorting::Descending);
-        // every push keeps the DESC order, the last one folds the full head into main
+        // every push keeps the DESC order
         let top: u32 = 4 + HEAD_SIZE as u32;
         (4..=top).for_each(|x: u32| ev.push_front(x));
 
@@ -2518,12 +2528,43 @@ mod tests {
     }
 
     #[test]
-    fn test_compact_keeps_capacity() {
+    #[rustfmt::skip]
+    fn test_compact_capacity() {
         let mut ev: EnhVec<u32> = EnhVec::new_with_capacity(1000);
         (0..=HEAD_SIZE as u32).for_each(|x: u32| ev.push_front(x));
-        assert!(ev.data.head.len() < HEAD_SIZE, "head was compacted");
+        ev.sort(Sorting::Ascending); // folds the head into main
+        assert!(ev.data.head.is_empty(), "head was compacted");
         let capacity: usize = ev.data.main.capacity();
-        assert!(capacity >= 1000, "main capacity {capacity}");
+        assert!(capacity >= 1000, "main capacity {capacity} kept");
+
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(0..1000);
+        (0..1000).for_each(|x: u32| ev.push_front(x));
+        let capacity: usize = ev.into_vec().capacity();
+        assert!(capacity < 2100, "into_vec() capacity {capacity} not doubled");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_pop_both_ends_keeps_order() {
+        let n: u32 = 1000;
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(0..n);
+        let popped: Vec<u32> = from_fn(|| ev.pop_front()).collect();
+        assert_eq!(popped, (0..n).collect::<Vec<u32>>(), "pop_front() after push()");
+
+        (0..n).for_each(|x: u32| ev.push_front(x));
+        let popped: Vec<u32> = from_fn(|| ev.pop()).collect();
+        assert_eq!(popped, (0..n).collect::<Vec<u32>>(), "pop() after push_front()");
+
+        // alternate between the ends, which rebalances between head and main
+        (0..n).for_each(|x: u32| ev.push(x));
+        let mut expected: VecDeque<u32> = (0..n).collect();
+        for i in 0..n {
+            let (got, want) = match i % 3 {
+                0 => (ev.pop_front(), expected.pop_front()),
+                _ => (ev.pop(), expected.pop_back()),
+            };
+            assert_eq!(got, want, "alternating pops, step {i}");
+        }
     }
 
     #[test]
