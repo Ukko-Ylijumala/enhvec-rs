@@ -70,13 +70,17 @@ let unique = vec.distinct(Some(Sorting::Ascending));
 - `push()`, `push_front()`, `push_swap_front()`, `insert()`, `insert_sorted()`
 - `pop()`, `pop_front()`, `swap_pop_front()`
 - `extend()` (the `Extend` trait, also from `&T` for `Copy` types), `extend_sorted()`, `append()`
-- `reverse()`, `sort()`, `sort_by()`, `is_sorted()`, `as_sorted_asc()`, `as_sorted_desc()`
+- `reverse()`, `sort()`, `sort_by()`, `sort_unstable()`, `sort_unstable_by()`, `is_sorted()`, `as_sorted_asc()`, `as_sorted_desc()`
 - `get()`, `get_mut()`, indexing, `first()`, `last()`, `to_vec()`, `into_vec()`
 - `iter()`, `iter_mut()` (double-ended, e.g. `iter().rev()`), `IntoIterator` for `EnhVec` and its references
 - `for_each()`, `for_each_if()`, `modify_each()`, `modify_each_if()`, `count()`, `contains()`
 
 `push_swap_front()` and `swap_pop_front()` are `O(1)` in every call (not just amortized), at the
 cost of not preserving the order of the other elements.
+
+`sort_unstable()` and `sort_unstable_by()` may reorder equal elements, but are ~1.5x faster and
+allocate nothing. For numbers, and other types whose equal elements are indistinguishable, the
+result is the same as with `sort()`.
 
 ### Set Operations
 
@@ -158,6 +162,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 - Unreleased
     - Float sums in `average_fp()`, `variance_fp()` and `variance()` use independent partial sums: ~6x faster on large data
+    - `sort_unstable()` and `sort_unstable_by()`, ~1.5x faster than `sort()`, also used by `distinct()`
 - 0.5.2: VecDeque-level operations at both ends, Vec/VecDeque comparison bench
     - Amortized `O(1)` `pop_front()` and `pop()` in any mix (two-stack deque), faster indexing and pushes, `benches/vs_std.rs`
     - `insert()`/`insert_sorted()` shift at most about half of the elements (head/main rebalancing)

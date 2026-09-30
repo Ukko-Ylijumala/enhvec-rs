@@ -73,13 +73,16 @@ struct EnhVecInner<T> {
 }
 
 impl<T> EnhVecInner<T> {
-    fn sort_by<F>(&mut self, f: F)
+    fn sort_by<F>(&mut self, f: F, stable: bool)
     where
         F: FnMut(&T, &T) -> Ordering,
     {
         self.set_changed(); // cannot know what `f` does to the order
         self.compact();
-        self.main.sort_by(f);
+        match stable {
+            true => self.main.sort_by(f),
+            false => self.main.sort_unstable_by(f),
+        }
     }
 
     fn new() -> Self {
@@ -445,10 +448,10 @@ impl<T: PartialOrd> EnhVecInner<T> {
 }
 
 impl<T: Ord> EnhVecInner<T> {
-    fn sort(&mut self, sorting: &Sorting) {
+    fn sort(&mut self, sorting: &Sorting, stable: bool) {
         // compact() keeps the order, so sort_vec() can trust the current state
         self.compact();
-        sort_vec(&mut self.main, &self.state, sorting);
+        sort_vec(&mut self.main, &self.state, sorting, stable);
         self.state = match sorting {
             Sorting::Ascending => SortState::Asc,
             Sorting::Descending => SortState::Desc,
@@ -609,7 +612,19 @@ impl<T> EnhVec<T> {
     where
         F: FnMut(&T, &T) -> Ordering,
     {
-        self.data.sort_by(f);
+        self.data.sort_by(f, true);
+        self.sort = Sorting::None;
+    }
+
+    /**
+    Like `sort_by()`, but equal elements may be reordered. Passthrough to
+    Vec::sort_unstable_by(), see `sort_unstable()` for why that is faster.
+    */
+    pub fn sort_unstable_by<F>(&mut self, f: F)
+    where
+        F: FnMut(&T, &T) -> Ordering,
+    {
+        self.data.sort_by(f, false);
         self.sort = Sorting::None;
     }
 
@@ -813,7 +828,19 @@ impl<T: Ord> EnhVec<T> {
     when it is, and a reversal when it is known to be in the opposite order.
     */
     pub fn sort(&mut self, sorting: Sorting) {
-        self.data.sort(&sorting);
+        self.data.sort(&sorting, true);
+        self.sort = sorting;
+    }
+
+    /**
+    Like `sort()`, but equal elements may be reordered (`slice::sort_unstable()`).
+    That is faster (~1.4x for 1M random `u64`s) and allocates no buffer. When
+    equal elements are indistinguishable, as with numbers, the result is the
+    same as with `sort()`. Also sets the default [Sorting], but note that
+    `extend_sorted()` re-sorts with `sort()`.
+    */
+    pub fn sort_unstable(&mut self, sorting: Sorting) {
+        self.data.sort(&sorting, false);
         self.sort = sorting;
     }
 
@@ -831,13 +858,13 @@ impl<T: Ord> EnhVec<T> {
     /// Return references to entries in ASCending order.
     pub fn as_sorted_asc(&self) -> Vec<&T> {
         let mut vec: Vec<&T> = self.as_ref_vec();
-        sort_vec(&mut vec, &self.data.state, &Sorting::Ascending);
+        sort_vec(&mut vec, &self.data.state, &Sorting::Ascending, true);
         vec
     }
     /// Return references to entries in DESCending order.
     pub fn as_sorted_desc(&self) -> Vec<&T> {
         let mut vec: Vec<&T> = self.as_ref_vec();
-        sort_vec(&mut vec, &self.data.state, &Sorting::Descending);
+        sort_vec(&mut vec, &self.data.state, &Sorting::Descending, true);
         vec
     }
 
@@ -1374,7 +1401,8 @@ impl<T: Copy + Eq + Hash> EnhVec<T> {
             result.data.state = self.data.state.clone();
         }
         if let Some(sorting) = sorted {
-            result.sort(sorting);
+            // the elements are unique, so this is the same as a stable sort
+            result.sort_unstable(sorting);
         }
         result
     }
@@ -1770,7 +1798,8 @@ where
 }
 
 /// Sort a vector in place, based on the current and desired sorting state.
-fn sort_vec<T: Ord>(v: &mut [T], state: &SortState, desired: &Sorting) {
+/// Unless `stable`, equal elements may be reordered.
+fn sort_vec<T: Ord>(v: &mut [T], state: &SortState, desired: &Sorting, stable: bool) {
     // short circuit no-ops
     let noop: bool = matches!(
         (state, desired),
@@ -1783,10 +1812,11 @@ fn sort_vec<T: Ord>(v: &mut [T], state: &SortState, desired: &Sorting) {
     }
 
     if state.is_unsorted() {
-        if *desired == Sorting::Ascending {
-            v.sort();
-        } else {
-            v.sort_by(|a, b| b.cmp(a));
+        match (desired, stable) {
+            (Sorting::Ascending, true) => v.sort(),
+            (Sorting::Ascending, false) => v.sort_unstable(),
+            (_, true) => v.sort_by(|a, b| b.cmp(a)),
+            (_, false) => v.sort_unstable_by(|a, b| b.cmp(a)),
         }
     } else {
         // we already know the vec is sorted, but not in the desired order
@@ -2481,6 +2511,30 @@ mod tests {
         let sorted: Vec<f64> = ev.to_vec();
         assert_eq!(sorted[..3], [-1.0, 2.0, 3.0]);
         assert!(sorted[3].is_nan());
+    }
+
+    #[test]
+    fn test_sort_unstable() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        ev.push_front(XTRA);
+        ev.sort_unstable(Sorting::Ascending);
+        let mut test: Vec<u32> = Vec::from_iter(PI_ASC);
+        test.push(XTRA);
+        assert_eq!(ev.to_vec(), test, "ascending");
+        assert_eq!(ev.median(), Some(test[test.len() / 2]), "median");
+        ev.insert_sorted(0);
+        test.insert(0, 0);
+        assert_eq!(ev.to_vec(), test, "insert_sorted()");
+
+        ev.sort_unstable(Sorting::Descending);
+        test.reverse();
+        assert_eq!(ev.to_vec(), test, "descending");
+
+        let mut fp: EnhVec<f64> = EnhVec::from_iter([3.0, f64::NAN, -1.0, 2.0]);
+        fp.sort_unstable_by(f64::total_cmp);
+        let sorted: Vec<f64> = fp.to_vec();
+        assert_eq!(sorted[..3], [-1.0, 2.0, 3.0], "sort_unstable_by()");
+        assert!(sorted[3].is_nan(), "sort_unstable_by() with NaN");
     }
 
     #[test]

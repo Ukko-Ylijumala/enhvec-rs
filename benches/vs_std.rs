@@ -398,6 +398,25 @@ fn sorting(c: &mut Criterion) {
         );
     });
 
+    groups(c, "sort_unstable", |g, n| {
+        let data: Vec<u64> = random(n, 42);
+        bench(g, VEC, n, || alternating_vec(&data), |v| v.sort_unstable());
+        bench(
+            g,
+            DEQUE,
+            n,
+            || alternating_deque(&data),
+            |v| v.make_contiguous().sort_unstable(),
+        );
+        bench(
+            g,
+            ENHVEC,
+            n,
+            || alternating_enhvec(&data),
+            |v| v.sort_unstable(Sorting::Ascending),
+        );
+    });
+
     groups(c, "sort_sorted", |g, n| {
         let data: Vec<u64> = sorted(&random(n, 42));
         let sorted_enhvec = || {
