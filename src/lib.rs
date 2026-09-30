@@ -155,10 +155,16 @@ impl<T> EnhVecInner<T> {
         })
     }
 
-    /// Reverse the order of the elements in place and set state accordingly.
+    /**
+    Reverse the order of the elements in place and set state accordingly.
+
+    The logical order is `rev(head) ++ main`, so the reverse is `rev(main) ++ head`.
+    The head is already stored in the order the new tail needs, so it is
+    simply appended to the reversed main Vec.
+    */
     fn reverse(&mut self) {
-        self.head.reverse();
         self.main.reverse();
+        self.main.append(&mut self.head);
         if self.state.is_sorted() {
             self.state.reverse();
         } else {
@@ -1670,5 +1676,23 @@ mod tests {
         assert_eq!(ev.to_vec(), vec![0, 1, XTRA, 2, 10, 11], "insert inside head");
         ev.insert(4, XTRA);
         assert_eq!(ev.to_vec(), vec![0, 1, XTRA, 2, XTRA, 10, 11], "insert at head/main junction");
+    }
+
+    #[test]
+    fn test_reverse_with_head() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter([3, 4]);
+        ev.push_front(2);
+        ev.push_front(1);
+        ev.reverse();
+        assert_eq!(ev.to_vec(), vec![4, 3, 2, 1]);
+
+        let mut sorted: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        sorted.sort(Sorting::Ascending);
+        sorted.push_front(0); // keeps ASC order, lands in the head
+        sorted.reverse();
+        let mut test: Vec<u32> = Vec::from_iter(PI_DESC);
+        test.push(0);
+        assert_eq!(sorted.to_vec(), test);
+        assert_eq!(sorted.as_sorted_desc(), test.iter().collect::<Vec<&u32>>());
     }
 }
