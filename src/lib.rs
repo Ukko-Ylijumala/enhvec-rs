@@ -1130,13 +1130,15 @@ impl<T: Integer> EnhVec<T> {
         let mid: usize = sorted.len() / 2;
 
         if sorted.len() % 2 == 0 {
-            Some((*sorted[mid - 1] + *sorted[mid]) / T::from_usize(2).unwrap())
+            // unlike `(a + b) / 2`, midpoint() cannot overflow
+            Some(T::midpoint(*sorted[mid - 1], *sorted[mid]))
         } else {
             Some(*sorted[mid])
         }
     }
 
     /// Return the average (mean) value of the elements.
+    /// The elements are summed as `i128`, so the sum cannot overflow `T`.
     pub fn average(&self) -> Option<f64>
     where
         T: Into<i128>,
@@ -1145,22 +1147,23 @@ impl<T: Integer> EnhVec<T> {
             return None;
         }
 
-        let sum: i128 = self.data.internal_iter().copied().sum::<T>().into();
+        let sum: i128 = self.data.internal_iter().map(|&x: &T| x.into()).sum();
         Some(sum as f64 / self.len() as f64)
     }
 
     /// Return the product of all elements. For empty EnhVec, `product == 1`.
-    /// To avoid overflow, multiplications are performed as `i128`.
-    pub fn product(&self) -> i128
+    /// Multiplications are performed as `i128`, and `None` means it overflowed.
+    pub fn product(&self) -> Option<i128>
     where
         T: Into<i128>,
     {
         self.data
             .internal_iter()
-            .fold(1, |acc: i128, &x| acc * x.into())
+            .try_fold(1, |acc: i128, &x| acc.checked_mul(x.into()))
     }
 
-    /// Return the variance of the elements.
+    /// Return the population variance of the elements, ie. the mean of
+    /// the squared deviations from the mean (divided by `N`).
     pub fn variance(&self) -> Option<f64>
     where
         T: Into<i128>,
@@ -1189,7 +1192,8 @@ impl<T: Integer> EnhVec<T> {
 
     /// Return the percentile value of the elements. NOTE: `0.0 <=` [p] `<= 1.0`
     pub fn percentile(&self, p: f64) -> Option<T> {
-        if self.is_empty() || p < 0.0 || p > 1.0 {
+        // written as !contains() so that a NaN `p` is rejected as well
+        if self.is_empty() || !(0.0..=1.0).contains(&p) {
             return None;
         }
 
@@ -1203,18 +1207,19 @@ impl<T: Integer> EnhVec<T> {
 
 impl<T: Float> EnhVec<T> {
     /// Return the median (aka. the middle) value of the elements.
-    /// Floating point compatible version.
+    /// Floating point compatible version. NaNs are ordered by `total_cmp()`.
     pub fn median_fp(&self) -> Option<T> {
         if self.is_empty() {
             return None;
         }
 
         let mut sorted: Vec<T> = self.to_vec();
-        sorted.sort_by(|a: &T, b: &T| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        sorted.sort_by(T::total_cmp);
         let mid: usize = sorted.len() / 2;
 
         if sorted.len() % 2 == 0 {
-            T::from_usize(2).and_then(|two: T| Some((sorted[mid - 1] + sorted[mid]) / two))
+            // unlike `(a + b) / 2`, midpoint() cannot overflow to infinity
+            Some(T::midpoint(sorted[mid - 1], sorted[mid]))
         } else {
             Some(sorted[mid])
         }
@@ -1236,7 +1241,8 @@ impl<T: Float> EnhVec<T> {
         self.data.internal_iter().fold(T::one(), |acc, &x| acc * x)
     }
 
-    /// Return the variance of the elements. Floating point version.
+    /// Return the population variance of the elements (divided by `N`).
+    /// Floating point version.
     pub fn variance_fp(&self) -> Option<T> {
         if self.len() < 2 {
             return None;
@@ -1248,7 +1254,7 @@ impl<T: Float> EnhVec<T> {
             .internal_iter()
             .map(|&x| (x - mean).powi(2))
             .sum::<T>()
-            / T::from_usize(self.len() - 1).unwrap();
+            / T::from_usize(self.len()).unwrap();
         Some(variance)
     }
 
@@ -1258,14 +1264,15 @@ impl<T: Float> EnhVec<T> {
     }
 
     /// Return the percentile value of the elements. Floating point version.
-    /// NOTE: `0.0 <=` [p] `<= 1.0`
+    /// NOTE: `0.0 <=` [p] `<= 1.0`. NaNs are ordered by `total_cmp()`.
     pub fn percentile_fp(&self, p: f64) -> Option<T> {
-        if self.is_empty() || p < 0.0 || p > 1.0 {
+        // written as !contains() so that a NaN `p` is rejected as well
+        if self.is_empty() || !(0.0..=1.0).contains(&p) {
             return None;
         }
 
         let mut sorted: Vec<T> = self.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+        sorted.sort_by(T::total_cmp);
         let index: usize = (p * (self.len() - 1) as f64).round() as usize;
         Some(sorted[index])
     }
@@ -1290,6 +1297,8 @@ pub trait Integer:
     fn zero() -> Self;
     fn one() -> Self;
     fn from_usize(n: usize) -> Option<Self>;
+    /// `(self + rhs) / 2` without overflow, rounded towards zero.
+    fn midpoint(self, rhs: Self) -> Self;
 }
 
 /// Common code for "small" integer types.
@@ -1303,6 +1312,8 @@ macro_rules! impl_integer {
                 fn one() -> Self { 1 }
                 #[inline]
                 fn from_usize(n: usize) -> Option<Self> { n.try_into().ok() }
+                #[inline]
+                fn midpoint(self, rhs: Self) -> Self { self.midpoint(rhs) }
             }
         )*
     }
@@ -1319,6 +1330,8 @@ macro_rules! impl_big_integer {
                 fn one() -> Self { 1 }
                 #[inline]
                 fn from_usize(n: usize) -> Option<Self> { Some(n as Self) }
+                #[inline]
+                fn midpoint(self, rhs: Self) -> Self { self.midpoint(rhs) }
             }
         )*
     }
@@ -1375,6 +1388,10 @@ pub trait Float:
     fn from_usize(n: usize) -> Option<Self>;
     fn powi(self, n: i32) -> Self;
     fn sqrt(self) -> Self;
+    /// `(self + rhs) / 2` without overflowing to infinity.
+    fn midpoint(self, rhs: Self) -> Self;
+    /// Total ordering, including NaN (see [f64::total_cmp]).
+    fn total_cmp(&self, other: &Self) -> Ordering;
 }
 
 /// Common code for floating point types.
@@ -1392,6 +1409,10 @@ macro_rules! impl_float {
                 fn powi(self, n: i32) -> Self { self.powi(n) }
                 #[inline]
                 fn sqrt(self) -> Self { self.sqrt() }
+                #[inline]
+                fn midpoint(self, rhs: Self) -> Self { self.midpoint(rhs) }
+                #[inline]
+                fn total_cmp(&self, other: &Self) -> Ordering { self.total_cmp(other) }
             }
         )*
     }
@@ -1647,7 +1668,7 @@ mod tests {
         let ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
         let mut prod: i128 = 1;
         ev.for_each(|x: &u32| prod *= *x as i128);
-        assert_eq!(ev.product(), prod);
+        assert_eq!(ev.product(), Some(prod));
     }
 
     #[test]
@@ -1720,7 +1741,7 @@ mod tests {
         let ev: EnhVec<i32> = EnhVec::new();
         assert!(ev.is_empty());
         assert_eq!(ev.sum(), 0, "sum is not zero");
-        assert_eq!(ev.product(), 1, "product is not one");
+        assert_eq!(ev.product(), Some(1), "product is not one");
         assert_eq!(ev.range(), None, "range is not None");
         assert_eq!(ev.median(), None, "median is not None");
         assert_eq!(ev.mode(), None, "mode is not None");
@@ -1736,7 +1757,7 @@ mod tests {
         let purpose: i32 = 42;
         let ev: EnhVec<i32> = EnhVec::from_iter(vec![purpose]);
         assert_eq!(ev.sum(), purpose, "sum");
-        assert_eq!(ev.product(), purpose.into(), "product");
+        assert_eq!(ev.product(), Some(purpose.into()), "product");
         assert_eq!(ev.range(), Some(0), "range");
         assert_eq!(ev.median(), Some(purpose), "median");
         assert_eq!(ev.mode(), Some(purpose), "mode");
@@ -2000,5 +2021,56 @@ mod tests {
             hasher.finish()
         };
         assert_ne!(digest(&[1, 2], &[3]), digest(&[1], &[2, 3]), "xxh3 of adjacent EnhVecs");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_integer_overflow() {
+        let ev: EnhVec<u8> = EnhVec::from_iter([200, 250]);
+        assert_eq!(ev.average(), Some(225.0), "average u8");
+        assert_eq!(ev.median(), Some(225), "median u8");
+        let ev: EnhVec<i8> = EnhVec::from_iter([-128, 127]);
+        assert_eq!(ev.median(), Some(0), "median i8, rounded towards zero");
+        let ev: EnhVec<i32> = EnhVec::from_iter([-3, -2]);
+        assert_eq!(ev.median(), Some(-2), "median i32, rounded towards zero");
+        let ev: EnhVec<u64> = EnhVec::from_iter([u64::MAX, u64::MAX - 2]);
+        assert_eq!(ev.median(), Some(u64::MAX - 1), "median u64");
+
+        let ev: EnhVec<u32> = EnhVec::from_iter([10; 38]);
+        assert_eq!(ev.product(), Some(10i128.pow(38)), "product");
+        let ev: EnhVec<u32> = EnhVec::from_iter([10; 39]);
+        assert_eq!(ev.product(), None, "product overflowing i128");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_variance_and_stdev_fp() {
+        // same data and population variance as in test_variance_and_stdev()
+        let ev: EnhVec<f64> = EnhVec::from_iter([2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
+        let var_diff: f64 = ev.variance_fp().unwrap() - 4.0;
+        let std_diff: f64 = ev.stdev_fp().unwrap() - 2.0;
+        assert!(var_diff.abs() < EPSILON, "variance diff ({var_diff}) not within epsilon");
+        assert!(std_diff.abs() < EPSILON, "stdev diff ({std_diff}) not within epsilon");
+    }
+
+    #[test]
+    fn test_percentile_nan() {
+        let ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        assert_eq!(ev.percentile(f64::NAN), None, "percentile");
+        let ev: EnhVec<f64> = EnhVec::from_iter(FP_ARR);
+        assert_eq!(ev.percentile_fp(f64::NAN), None, "percentile_fp");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_fp_edge_values() {
+        // total_cmp() orders (positive) NaN after all numbers
+        let ev: EnhVec<f64> = EnhVec::from_iter([3.0, f64::NAN, 1.0, 2.0]);
+        assert_eq!(ev.median_fp(), Some(2.5), "median_fp with NaN");
+        assert_eq!(ev.percentile_fp(0.0), Some(1.0), "percentile_fp 0.0 with NaN");
+        assert!(ev.percentile_fp(1.0).is_some_and(f64::is_nan), "percentile_fp 1.0 with NaN");
+
+        let ev: EnhVec<f64> = EnhVec::from_iter([f64::MAX, f64::MAX]);
+        assert_eq!(ev.median_fp(), Some(f64::MAX), "median_fp without overflow");
     }
 }
