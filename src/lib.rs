@@ -448,7 +448,8 @@ impl<T: Ord> EnhVecInner<T> {
 
 impl<T: PartialEq> PartialEq for EnhVecInner<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.head == other.head && self.main == other.main
+        // compare the logical order, not how the elements are split between head and main
+        self.len() == other.len() && self.internal_iter().eq(other.internal_iter())
     }
 }
 
@@ -867,6 +868,8 @@ impl<T: PartialEq> PartialEq for EnhVec<T> {
         self.data == other.data
     }
 }
+
+impl<T: Eq> Eq for EnhVec<T> {}
 
 // Allow indexing into EnhVec
 impl<T> Index<usize> for EnhVec<T> {
@@ -1925,5 +1928,21 @@ mod tests {
         assert!(big.is_proper_superset(&small) && !dups.is_proper_superset(&small), "is_proper_superset");
         assert!(small.is_proper(&big) && big.is_proper(&small), "is_proper");
         assert!(!small.is_proper(&other) && !small.is_proper(&dups), "is_proper");
+    }
+
+    #[test]
+    fn test_eq_ignores_layout() {
+        let ev1: EnhVec<u32> = EnhVec::from_iter([1, 2, 3]);
+        let mut ev2: EnhVec<u32> = EnhVec::from_iter([2, 3]);
+        ev2.push_front(1);
+        assert_eq!(ev1, ev2, "same elements, different head/main split");
+
+        let set: HashSet<EnhVec<u32>> = HashSet::from([ev1.clone()]);
+        assert!(set.contains(&ev2), "usable as a HashSet key");
+
+        ev2.push_front(0);
+        assert_ne!(ev1, ev2, "different elements");
+        let ev3: EnhVec<u32> = EnhVec::from_iter([3, 2, 1]);
+        assert_ne!(ev1, ev3, "different order");
     }
 }
