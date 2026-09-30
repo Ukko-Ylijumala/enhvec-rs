@@ -120,9 +120,15 @@ appearance unless asked to sort, so both are deterministic.
 
 ### Hashing
 
-- `Hash`: the elements are hashed in sorted order (plus the length), so equal sets of elements
-  hash the same regardless of their order
-- Stable hashing via the `Xxh3Hashable` trait: `xxh3()` and `xxh3_digest()`
+- `Hash`: each element is hashed on its own with xxh3, and the sum and XOR of these digests are
+  hashed along with the length. Equal sets of elements hash the same regardless of their order,
+  in `O(N)` without sorting or allocating, and the elements need no `Ord`
+- Stable hashing via the `Xxh3Hashable` trait: `xxh3()` and `xxh3_digest()`, the same way but
+  with each element's `xxh3_digest()`
+
+The element digests do not use the random keys of the hasher given to `Hash`, so whoever controls
+the elements can search for colliding sets offline. Keep that in mind before using EnhVecs of
+untrusted data as `HashMap` keys.
 
 ## Performance
 
@@ -163,6 +169,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - Unreleased
     - Float sums in `average_fp()`, `variance_fp()` and `variance()` use independent partial sums: ~6x faster on large data
     - `sort_unstable()` and `sort_unstable_by()`, ~1.5x faster than `sort()`, also used by `distinct()`
+    - Order-independent hashing from per-element digests instead of a sort: ~25x faster for unsorted data, ~2x for sorted, and `Hash`/`Xxh3Hashable` no longer require `Ord`
+    - Breaking: `Hash`/`xxh3` values change, and a `custom_xxh3` with `QuickXxh3Hasher` is required
 - 0.5.2: VecDeque-level operations at both ends, Vec/VecDeque comparison bench
     - Amortized `O(1)` `pop_front()` and `pop()` in any mix (two-stack deque), faster indexing and pushes, `benches/vs_std.rs`
     - `insert()`/`insert_sorted()` shift at most about half of the elements (head/main rebalancing)

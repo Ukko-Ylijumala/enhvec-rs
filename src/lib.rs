@@ -1,6 +1,6 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
-use custom_xxh3::{CustomXxh3Hasher, Xxh3Hashable};
+use custom_xxh3::{hash_item, QuickXxh3Hasher, Xxh3Hashable};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -868,20 +868,6 @@ impl<T: Ord> EnhVec<T> {
         vec
     }
 
-    /**
-    Run a closure on each element in ASCending order, for hashing. Unlike
-    iterating `as_sorted_asc()`, nothing is collected or sorted if the order
-    is known, and otherwise equal elements may come in any order: they are
-    equal by [Eq] too (see [Ord]), so they also hash the same.
-    */
-    fn for_each_asc(&self, f: impl FnMut(&T)) {
-        match self.data.state {
-            SortState::Asc => self.data.internal_iter().for_each(f),
-            SortState::Desc => self.data.internal_iter().rev().for_each(f),
-            _ => self.asc_refs().into_iter().for_each(f),
-        }
-    }
-
     /// References to the elements in ASCending order, sorted only if the order
     /// is not known. Equal elements come in no particular order.
     fn asc_refs(&self) -> Vec<&T> {
@@ -1294,7 +1280,7 @@ impl<'a, T> IntoIterator for &'a mut EnhVec<T> {
 
 /* ################## Hashing and custom hashing behaviour ################# */
 
-impl<T: Ord + Hash> Hash for EnhVec<T> {
+impl<T: Hash> Hash for EnhVec<T> {
     /**
     The hash of a Vec is **not** the same as iterating over the elements
     and accumulating the state from each one individually. Per the docs:
@@ -1303,43 +1289,54 @@ impl<T: Ord + Hash> Hash for EnhVec<T> {
 
     Hence we must implement our own hashing method since we want to be able
     to repeatably produce the same hash from the same set of elements,
-    regardless of any other factors. This also means that we must always
-    hash the elements in the same (sorted) order, AND that the hash algo
-    must be stable (i.e. always produce the same hash for the same input).
+    regardless of their order. Rather than hashing the elements in sorted
+    order, which needs a sort unless the order is known, each element is
+    hashed on its own with xxh3 (see [custom_xxh3::hash_item]). The sum and
+    XOR of these digests do not depend on the order, and they are hashed
+    along with the length. This is `O(N)`, needs no [Ord] and never allocates.
 
     Since the standard hasher is not stable, the output of this method
     will not be the same across different runs of the program, and will
     change each time the standard hasher's [std::hash::RandomState] changes.
 
+    The element digests do not depend on the given hasher though, so its
+    random keys only protect the final step: whoever controls the elements
+    can search for colliding sets offline. Keep this in mind before using
+    EnhVecs of untrusted data as [HashMap] keys.
+
     To produce truly repeatable hashes, it is recommended to use the `xxh3()`
     or `xxh3_digest()` methods instead, which use a stable hasher.
 
-    Like the standard slice hash, the length is hashed first, so that e.g.
+    Each [EnhVec] adds the same number of values to the hash, so that e.g.
     the tuples `([1, 2], [3])` and `([1], [2, 3])` do not collide.
     */
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
+        let (sum, xor): (u64, u64) = fold_digests(self.data.internal_iter().map(hash_item));
         state.write_usize(self.len());
-        self.for_each_asc(|elem: &T| elem.hash(state));
+        state.write_u64(sum);
+        state.write_u64(xor);
     }
 }
 
-impl<T: Ord + Xxh3Hashable> Xxh3Hashable for EnhVec<T> {
+impl<T: Xxh3Hashable> Xxh3Hashable for EnhVec<T> {
     /**
     This method is used to hash the elements in a stable, repeatable way.
-    Internally it works just like the standard `hash()` method, ie. it
-    updates the state of the given hasher with each element in turn.
+    Like the standard `hash()` method, it hashes the length and the sum and
+    XOR of the element digests, which do not depend on the element order.
 
-    The element in question must implement the [Xxh3Hashable] trait and
-    actually hash itself using the `xxh3()` method of course.
+    The element in question must implement the [Xxh3Hashable] trait, and
+    its `xxh3_digest()` is the digest of each element.
 
-    The length is hashed first (see [Hash]), as a little-endian `u64` to
-    keep the result the same across platforms.
+    The values are hashed as little-endian `u64`s, to keep the result the
+    same across platforms.
     */
     #[inline]
     fn xxh3<H: Hasher>(&self, state: &mut H) {
+        let (sum, xor): (u64, u64) = fold_digests(self.data.internal_iter().map(T::xxh3_digest));
         state.write(&(self.len() as u64).to_le_bytes());
-        self.for_each_asc(|elem: &T| elem.xxh3(state));
+        state.write(&sum.to_le_bytes());
+        state.write(&xor.to_le_bytes());
     }
 
     /**
@@ -1348,7 +1345,8 @@ impl<T: Ord + Xxh3Hashable> Xxh3Hashable for EnhVec<T> {
     */
     #[inline]
     fn xxh3_digest(&self) -> u64 {
-        let mut hasher: CustomXxh3Hasher = CustomXxh3Hasher::default();
+        // same result as a CustomXxh3Hasher, without setting up its streaming state
+        let mut hasher: QuickXxh3Hasher = QuickXxh3Hasher::default();
         self.xxh3(&mut hasher);
         hasher.finish()
     }
@@ -1797,6 +1795,16 @@ where
     (*nth, next)
 }
 
+/**
+The sum and XOR of `digests`, which do not depend on their order. Unlike
+with XOR alone, equal digests do not cancel out in the sum.
+*/
+fn fold_digests(digests: impl Iterator<Item = u64>) -> (u64, u64) {
+    digests.fold((0, 0), |(sum, xor): (u64, u64), digest: u64| {
+        (sum.wrapping_add(digest), xor ^ digest)
+    })
+}
+
 /// Sort a vector in place, based on the current and desired sorting state.
 /// Unless `stable`, equal elements may be reordered.
 fn sort_vec<T: Ord>(v: &mut [T], state: &SortState, desired: &Sorting, stable: bool) {
@@ -1831,6 +1839,7 @@ fn sort_vec<T: Ord>(v: &mut [T], state: &SortState, desired: &Sorting, stable: b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use custom_xxh3::CustomXxh3Hasher;
     use std::{collections::VecDeque, hash::DefaultHasher, iter::from_fn};
 
     const PI_LEN: usize = 16;
@@ -2729,6 +2738,25 @@ mod tests {
             hasher.finish()
         };
         assert_ne!(digest(&[1, 2], &[3]), digest(&[1], &[2, 3]), "xxh3 of adjacent EnhVecs");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_hash_counts_duplicates() {
+        // same length and XOR of the element digests, so only the sum tells these apart
+        let pairs: [([u32; 4], [u32; 4]); 2] = [([1, 1, 2, 2], [3, 3, 4, 4]), ([1, 1, 1, 2], [1, 2, 2, 2])];
+        for (a, b) in pairs {
+            let (ev_a, ev_b): (EnhVec<u32>, EnhVec<u32>) = (EnhVec::from_iter(a), EnhVec::from_iter(b));
+            assert_ne!(std_hash(&ev_a), std_hash(&ev_b), "Hash of {a:?} and {b:?}");
+            assert_ne!(xxh3_vec(&a).xxh3_digest(), xxh3_vec(&b).xxh3_digest(), "xxh3 of {a:?} and {b:?}");
+        }
+
+        // hashing needs no Ord
+        #[derive(Debug, PartialEq, Eq, PartialOrd, Hash)]
+        struct NoOrd(&'static str);
+        let ab: EnhVec<NoOrd> = EnhVec::from_iter([NoOrd("a"), NoOrd("b")]);
+        let ba: EnhVec<NoOrd> = EnhVec::from_iter([NoOrd("b"), NoOrd("a")]);
+        assert_eq!(std_hash(&ab), std_hash(&ba), "Hash without Ord ignores order");
     }
 
     #[test]
