@@ -68,7 +68,8 @@ let unique = vec.distinct(Some(Sorting::Ascending));
 ### Vector Operations
 
 - `push()`, `push_front()`, `push_swap_front()`, `insert()`, `insert_sorted()`
-- `pop()`, `pop_front()`, `swap_pop_front()`
+- `pop()`, `pop_front()`, `swap_pop_front()`, `remove()`, `truncate()`, `clear()`
+- `retain()`, `dedup()`, `drain()`, `split_off()`
 - `extend()` (the `Extend` trait, also from `&T` for `Copy` types), `extend_sorted()`, `append()`
 - `reverse()`, `sort()`, `sort_by()`, `sort_unstable()`, `sort_unstable_by()`, `sort_fp()`, `is_sorted()`, `as_sorted_asc()`, `as_sorted_desc()`
 - `get()`, `get_mut()`, indexing, `first()`, `last()`, `to_vec()`, `into_vec()`
@@ -87,9 +88,13 @@ The elements are always one slice, in order, so all slice methods work on an `En
 `binary_search()` follows the known order, so it also works on data sorted in descending order.
 
 With a known order (after `sort()` or, for floats, `sort_fp()`, or found by `insert_sorted()`),
-`contains()`, `count()` and `binary_search()` are `O(log N)`, and `mode()`, `distinct()` and `set_relation_sorted()` work
-on the elements in place, without hashing or sorting: ~600x faster lookups in 1M elements, and
-3-18x for the rest.
+`contains()`, `count()` and `binary_search()` are `O(log N)`, and `mode()`, `distinct()` and
+`set_relation_sorted()` work on the elements in place, without hashing or sorting: ~600x faster
+lookups in 1M elements, and 3-18x for the rest.
+
+The removals keep the order of the other elements, so a known order stays known.
+`remove()` moves the shorter part of the other elements, like `VecDeque`. `drain()` moves the
+elements out right away, into a Vec of their own, so its iterator does not borrow the `EnhVec`.
 
 `sort_unstable()` and `sort_unstable_by()` may reorder equal elements, but are ~1.5x faster and
 allocate nothing. For numbers, and other types whose equal elements are indistinguishable, the
@@ -192,6 +197,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
+- Unreleased: Vec methods that keep a known order
+    - `remove()`, `truncate()`, `clear()`, `retain()`, `dedup()`, `drain()` and `split_off()`
 - 0.6.1: Slice API, faster lookups in a known order, `sort_fp()`
     - `Deref`/`DerefMut` to `[T]`, `AsMut<[T]>`, indexing with ranges, `binary_search()` in the known order
     - With a known order: `contains()`, `count()` and the set operations binary search, and `mode()`, `distinct()` and `set_relation_sorted()` need no hashing or sorting

@@ -8,7 +8,7 @@ use std::{
     hash::{Hash, Hasher},
     iter::{FusedIterator, Sum},
     mem::{self, ManuallyDrop, MaybeUninit},
-    ops::{Add, Deref, DerefMut, Div, Index, IndexMut, Mul, Sub},
+    ops::{Add, Bound, Deref, DerefMut, Div, Index, IndexMut, Mul, Range, RangeBounds, Sub},
     ptr,
     slice::{self, Iter, IterMut, SliceIndex},
 };
@@ -257,6 +257,66 @@ impl<T> DeBuf<T> {
                 self.end += 1;
             }
         }
+    }
+
+    /// Remove the element at `index`, moving the shorter part of the others,
+    /// those before or after it, by one.
+    fn remove(&mut self, index: usize) -> T {
+        let len: usize = self.len();
+        assert!(index < len, "index {index} >= len {len}");
+        let at: usize = self.start + index;
+        let base: *mut T = self.buf.as_mut_ptr().cast();
+        // SAFETY: the element is read out once, and the moved elements are
+        // initialized. Nothing can panic before the ends are set.
+        unsafe {
+            let element: T = base.add(at).read();
+            if index < len / 2 {
+                ptr::copy(base.add(self.start), base.add(self.start + 1), index);
+                self.start += 1;
+            } else {
+                ptr::copy(base.add(at + 1), base.add(at), self.end - at - 1);
+                self.end -= 1;
+            }
+            element
+        }
+    }
+
+    /// Drop the elements after the first `len`, if there are more.
+    fn truncate(&mut self, len: usize) {
+        if len >= self.len() {
+            return;
+        }
+        let tail: *mut [T] = &mut self.as_mut_slice()[len..];
+        // like Vec::truncate(): shortened first, so that a panicking drop
+        // cannot drop an element twice
+        self.end = self.start + len;
+        // SAFETY: the tail is initialized, and now outside buf[start..end]
+        unsafe { ptr::drop_in_place(tail) };
+    }
+
+    /// Move the elements in `range` out into a Vec, closing the gap by
+    /// moving the shorter part of the others, those before or after it.
+    fn take_range(&mut self, range: Range<usize>) -> Vec<T> {
+        let (len, from, to): (usize, usize, usize) = (self.len(), range.start, range.end);
+        let in_bounds: bool = from <= to && to <= len;
+        assert!(in_bounds, "range {from}..{to} out of 0..{len}");
+        let n: usize = to - from;
+        let mut taken: Vec<T> = Vec::with_capacity(n);
+        // SAFETY: the range is moved out once, into the new Vec, and the
+        // moved elements are initialized. Nothing can panic in between.
+        unsafe {
+            let first: *mut T = self.buf.as_mut_ptr().add(self.start).cast();
+            ptr::copy_nonoverlapping(first.add(from), taken.as_mut_ptr(), n);
+            taken.set_len(n);
+            if from < len - to {
+                ptr::copy(first, first.add(n), from);
+                self.start += n;
+            } else {
+                ptr::copy(first.add(to), first.add(from), len - to);
+                self.end -= n;
+            }
+        }
+        taken
     }
 
     /**
@@ -942,6 +1002,101 @@ impl<T> EnhVec<T> {
     */
     pub fn swap_pop_front(&mut self) -> Option<T> {
         self.data.pop_front()
+    }
+
+    /**
+    Remove and return the element at `index`, moving the shorter part of the
+    others, like `VecDeque::remove()`: at most about half of the elements.
+    Keeps a known order. Panics if `index` is out of bounds, like `Vec::remove()`.
+    */
+    pub fn remove(&mut self, index: usize) -> T {
+        self.data.buf.remove(index)
+    }
+
+    /// Shorten to the first `len` elements, dropping the rest (nothing if
+    /// there are no more). Keeps a known order.
+    pub fn truncate(&mut self, len: usize) {
+        self.data.buf.truncate(len);
+    }
+
+    /// Remove all elements, keeping the capacity. A known order stays known
+    /// for the elements added later, as long as they are in order.
+    pub fn clear(&mut self) {
+        self.data.buf.truncate(0);
+    }
+
+    /**
+    Keep only the elements for which `f` returns true, in their order, so a
+    known order stays known. Like `Vec::retain()`, but the other elements are
+    dropped at the end. Time complexity: `O(N)`.
+    */
+    pub fn retain(&mut self, mut f: impl FnMut(&T) -> bool) {
+        // should `f` panic, the elements are left in another order
+        let state: SortState = mem::replace(&mut self.data.state, SortState::Changed);
+        let elements: &mut [T] = self.data.as_mut_slice();
+        let mut kept: usize = 0;
+        for i in 0..elements.len() {
+            if f(&elements[i]) {
+                elements.swap(kept, i);
+                kept += 1;
+            }
+        }
+        self.data.buf.truncate(kept);
+        self.data.state = state;
+    }
+
+    /**
+    Remove consecutive repeated elements, like `Vec::dedup()`, keeping the
+    order. In a known order that removes all duplicates. Time complexity: `O(N)`.
+    */
+    pub fn dedup(&mut self)
+    where
+        T: PartialEq,
+    {
+        // should `==` panic, the elements are left in another order
+        let state: SortState = mem::replace(&mut self.data.state, SortState::Changed);
+        let elements: &mut [T] = self.data.as_mut_slice();
+        let mut kept: usize = elements.len().min(1);
+        for i in 1..elements.len() {
+            if elements[i] != elements[kept - 1] {
+                elements.swap(kept, i);
+                kept += 1;
+            }
+        }
+        self.data.buf.truncate(kept);
+        self.data.state = state;
+    }
+
+    /**
+    Remove the elements in `range` and return them, in order. The gap is
+    closed by moving the shorter part of the others. Keeps a known order.
+    Unlike `Vec::drain()`, the elements are moved out right away, into a Vec
+    of their own, so the iterator does not borrow the [EnhVec]. Panics if
+    the range is out of bounds.
+    */
+    pub fn drain<R: RangeBounds<usize>>(&mut self, range: R) -> std::vec::IntoIter<T> {
+        let range: Range<usize> = to_range(range, self.len());
+        self.data.buf.take_range(range).into_iter()
+    }
+
+    /**
+    Split off the elements from `at` on, into a new [EnhVec] with the same
+    known order and default [Sorting]. Panics if `at > len`, like
+    `Vec::split_off()`.
+    */
+    pub fn split_off(&mut self, at: usize) -> Self {
+        let len: usize = self.len();
+        assert!(at <= len, "at {at} > len {len}");
+        let tail: Vec<T> = self.data.buf.take_range(at..len);
+        let data: EnhVecInner<T> = EnhVecInner {
+            state: self.data.state.clone(),
+            cmp: self.data.cmp,
+            buf: DeBuf::from_vec(tail),
+        };
+        Self {
+            data,
+            sort: self.sort,
+        }
     }
 
     pub fn get(&self, index: usize) -> Option<&T> {
@@ -2135,6 +2290,24 @@ fn equals_itself<T: PartialEq>(x: &T) -> bool {
     x == x
 }
 
+/// The positions of `range` among `len` elements. Panics if it is out of
+/// bounds, like slice indexing.
+fn to_range(range: impl RangeBounds<usize>, len: usize) -> Range<usize> {
+    let start: usize = match range.start_bound() {
+        Bound::Included(&start) => start,
+        Bound::Excluded(&start) => start.checked_add(1).expect("range start overflow"),
+        Bound::Unbounded => 0,
+    };
+    let end: usize = match range.end_bound() {
+        Bound::Included(&end) => end.checked_add(1).expect("range end overflow"),
+        Bound::Excluded(&end) => end,
+        Bound::Unbounded => len,
+    };
+    let in_bounds: bool = start <= end && end <= len;
+    assert!(in_bounds, "range {start}..{end} out of 0..{len}");
+    start..end
+}
+
 /// The index of the first element of `v` for which `pred` is false, `v` being
 /// partitioned by it. Linear search for small slices, binary for larger ones.
 fn partition_idx<T>(v: &[T], mut pred: impl FnMut(&T) -> bool) -> usize {
@@ -3275,6 +3448,74 @@ mod tests {
 
     #[test]
     #[rustfmt::skip]
+    fn test_removals_keep_order() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter([5, 1, 3, 3, 9, 1, 7, 3, 8, 2]);
+        ev.sort(Sorting::Descending);
+        let mut model: Vec<u32> = ev.to_vec();
+        // each one keeps the elements in order, so the known order stays
+        assert_eq!(ev.remove(7), model.remove(7), "remove() near the back");
+        assert_eq!(ev.remove(1), model.remove(1), "remove() near the front");
+        ev.retain(|&x| x != 5);
+        model.retain(|&x| x != 5);
+        ev.dedup();
+        model.dedup();
+        assert_eq!(ev.as_slice(), model, "retain() and dedup()");
+        let drained: Vec<u32> = ev.drain(1..2).collect();
+        assert_eq!(drained, model.drain(1..2).collect::<Vec<u32>>(), "drain()");
+        let tail: EnhVec<u32> = ev.split_off(2);
+        assert_eq!(tail.as_slice(), model.split_off(2), "split_off()");
+        assert!(tail.data.state == SortState::Desc && tail.contains(&1), "split_off() keeps the order");
+        ev.truncate(1);
+        model.truncate(1);
+        assert_eq!(ev.as_slice(), model, "truncate()");
+        assert!(ev.data.state == SortState::Desc && ev.contains(&9), "the known order stays");
+        ev.clear();
+        assert!(ev.is_empty() && ev.data.state == SortState::Desc, "clear()");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_drain_ranges() {
+        // with free space before the elements, and some ranges nearer the front
+        let mut base: EnhVec<u32> = EnhVec::from_iter(5..10);
+        (0..5).rev().for_each(|x: u32| base.push_front(x));
+        let ranges: [(Bound<usize>, Bound<usize>); 7] = [
+            (Bound::Unbounded, Bound::Unbounded), (Bound::Included(2), Bound::Unbounded),
+            (Bound::Unbounded, Bound::Excluded(3)), (Bound::Included(1), Bound::Included(4)),
+            (Bound::Included(3), Bound::Excluded(3)), (Bound::Excluded(6), Bound::Excluded(9)),
+            (Bound::Included(8), Bound::Included(9)),
+        ];
+        for range in ranges {
+            let (mut ev, mut model): (EnhVec<u32>, Vec<u32>) = (base.clone(), base.to_vec());
+            let drained: Vec<u32> = ev.drain(range).collect();
+            assert_eq!(drained, model.drain(range).collect::<Vec<u32>>(), "drained, {range:?}");
+            assert_eq!(ev.as_slice(), model, "left, {range:?}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "out of 0..3")]
+    fn test_drain_out_of_bounds() {
+        EnhVec::from_iter([1, 2, 3]).drain(2..4);
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_retain_panic() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(0..10);
+        ev.sort(Sorting::Ascending);
+        let panicked: bool = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ev.retain(|&x: &u32| if x == 6 { panic!("in retain()") } else { x % 2 == 0 })
+        })).is_err();
+        assert!(panicked, "panicked");
+        assert!(ev.data.ordering().is_none(), "no known order after the panic");
+        let mut all: Vec<u32> = ev.to_vec();
+        all.sort();
+        assert_eq!(all, (0..10).collect::<Vec<u32>>(), "no element lost or doubled");
+    }
+
+    #[test]
+    #[rustfmt::skip]
     fn test_vec_conversions_keep_the_buffer() {
         let mut ev: EnhVec<u32> = EnhVec::new_with_capacity(1000);
         let ptr: *const MaybeUninit<u32> = ev.data.buf.buf.as_ptr();
@@ -3505,7 +3746,7 @@ mod tests {
         let steps: usize = if cfg!(miri) { 300 } else { 3000 };
         for step in 0..steps {
             let x: usize = next(1000);
-            match next(11) {
+            match next(14) {
                 0 | 1 => {
                     buf.push_front(Counted::new(x, &live));
                     model.push_front(x);
@@ -3546,6 +3787,21 @@ mod tests {
                     assert!(v.iter().map(|c: &Counted| c.0).eq(model.iter().copied()), "into_vec, step {step}");
                     buf = DeBuf::from_vec(v);
                 }
+                10 if !model.is_empty() => {
+                    let idx: usize = next(model.len());
+                    assert_eq!(Some(buf.remove(idx).0), model.remove(idx), "remove, step {step}");
+                }
+                11 => {
+                    let len: usize = model.len().saturating_sub(next(5));
+                    buf.truncate(len);
+                    model.truncate(len);
+                }
+                12 => {
+                    let from: usize = next(model.len() + 1);
+                    let to: usize = from + next((model.len() - from).min(10) + 1);
+                    let taken: Vec<usize> = buf.take_range(from..to).into_iter().map(|c: Counted| c.0).collect();
+                    assert_eq!(taken, model.drain(from..to).collect::<Vec<usize>>(), "take_range, step {step}");
+                }
                 _ => {
                     let copy: DeBuf<Counted> = buf.clone();
                     assert!(copy.as_slice().iter().map(|c: &Counted| c.0).eq(model.iter().copied()));
@@ -3570,9 +3826,12 @@ mod tests {
         buf.extend([(); 5]);
         assert_eq!(buf.pop_front(), Some(()));
         assert_eq!(buf.pop_back(), Some(()));
+        assert_eq!((buf.remove(3), buf.remove(200)), ((), ()));
+        assert_eq!(buf.take_range(10..20).len(), 10);
+        buf.truncate(200);
         let v: Vec<()> = buf.into_vec();
-        assert_eq!(v.len(), 214);
-        assert_eq!(DeBuf::from_vec(v).clone().len(), 214);
+        assert_eq!(v.len(), 200);
+        assert_eq!(DeBuf::from_vec(v).clone().len(), 200);
     }
 
     #[test]
