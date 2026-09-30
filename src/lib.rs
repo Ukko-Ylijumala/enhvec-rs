@@ -12,8 +12,14 @@ use std::{
 
 /// The default size cutoff for linear/binary search.
 const SEARCH_SIZE_CUTOFF: usize = 32;
+/// Head size up to which `push_front()` never folds, and `push_swap_front()` swaps beyond.
 const HEAD_SIZE: usize = 16;
-const LARGE_VEC_THRESHOLD: usize = 512;
+/**
+Size (in bytes) of a main Vec from which growing it in place beats moving it
+into a fresh allocation, see `benches/vec_insert.rs`. Above roughly this size
+allocators (e.g. glibc) typically remap pages on realloc instead of copying.
+*/
+const LARGE_VEC_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 /// The expected sorting state of an [EnhVec].
@@ -68,7 +74,7 @@ impl<T> EnhVecInner<T> {
     fn new() -> Self {
         Self {
             state: SortState::Unsorted,
-            head: Vec::with_capacity(HEAD_SIZE),
+            head: Vec::new(),
             main: Vec::new(),
         }
     }
@@ -130,13 +136,11 @@ impl<T> EnhVecInner<T> {
     }
 
     fn pop(&mut self) -> Option<T> {
-        self.main.pop().or_else(|| {
-            if self.head.is_empty() {
-                None
-            } else {
-                Some(self.head.remove(0))
-            }
-        })
+        if self.main.is_empty() {
+            // take over the head in one go, instead of removing head[0] each time
+            self.compact();
+        }
+        self.main.pop()
     }
 
     fn pop_front(&mut self) -> Option<T> {
@@ -181,10 +185,11 @@ impl<T> EnhVecInner<T> {
     Fold the head elements into the main Vec. The order of the elements is
     preserved. If the head is empty, this is a no-op.
 
-    Tries to minimize computational complexity:
-    - for small main, a new Vec is re-allocated and elements are moved to it
-    - for large main, head elements are extended to the end of the main Vec,
-      then rotated to the front
+    Tries to minimize computational complexity (see `benches/vec_insert.rs`):
+    - with enough spare capacity, main is shifted once, in place
+    - else for small main, a new Vec is allocated and elements are moved to it,
+      as growing in place would copy main twice (realloc + shift)
+    - else main is grown and shifted in place, as large reallocations are cheap
     */
     fn compact(&mut self) {
         let head_len: usize = self.head.len();
@@ -193,18 +198,16 @@ impl<T> EnhVecInner<T> {
         }
 
         let main_len: usize = self.main.len();
-        if main_len < LARGE_VEC_THRESHOLD {
-            // reallocate if the main Vec is small
-            let mut tmp: Vec<T> = Vec::with_capacity(main_len + head_len);
+        let fits: bool = self.main.capacity() - main_len >= head_len;
+        if fits || main_len * size_of::<T>() >= LARGE_VEC_BYTES {
+            self.main.splice(0..0, self.head.drain(..).rev());
+        } else {
+            // grow the capacity like Vec::reserve() would, so it is not lost
+            let capacity: usize = (main_len + head_len).max(self.main.capacity() * 2);
+            let mut tmp: Vec<T> = Vec::with_capacity(capacity);
             tmp.extend(self.head.drain(..).rev());
             tmp.append(&mut self.main);
             self.main = tmp;
-        } else {
-            // if the main Vec is large, it's apparently computationally
-            // cheaper (at least according to the benchmarks) to rotate
-            // the elements in place than to reallocate
-            self.main.extend(self.head.drain(..).rev());
-            self.main.rotate_right(head_len);
         }
         if self.state.is_unsorted() {
             self.set_changed();
@@ -336,7 +339,8 @@ impl<T: PartialOrd> EnhVecInner<T> {
     }
 
     fn push_front(&mut self, element: T) {
-        if self.head.len() + 1 > HEAD_SIZE {
+        // fold the head only once it is as large as main: amortized O(1)
+        if self.head.len() >= HEAD_SIZE.max(self.main.len()) {
             self.compact();
         }
         self.head.push(element);
@@ -528,23 +532,19 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
     }
 
     /**
-    Insert an element at the start of the [EnhVec].
-
-    NOTE: potentially slow, as it may have to fold the head elements into
-    the main Vec. Time complexity: `O(N)` in that case. Prefer `push()`
-    and finally `sort()` if you need to maintain a certain order, or
-    `push_swap_front()` if you just need the new element to be the
-    first one and don't particularly care about the rest.
+    Insert an element at the start of the [EnhVec]. Time complexity:
+    amortized `O(1)`. The element goes to the head, which is folded into
+    the main Vec (`O(N)`) only once it has grown as large as the main Vec.
     */
     pub fn push_front(&mut self, element: T) {
         self.data.push_front(element);
     }
 
     /**
-    Insert an element at the end of the [EnhVec], then swap it with the
-    first element. This is a much faster way to push an element to the
-    front of the Vec than `push_front()`, as it doesn't require shifting
-    all other elements. Time complexity: `O(1)`.
+    Insert an element at the start of the [EnhVec]. Unlike `push_front()`,
+    this never folds the head into the main Vec: once the head is full, a few
+    elements are swapped around instead, so the order of the other elements
+    is not preserved. Time complexity: `O(1)`, not just amortized.
     */
     pub fn push_swap_front(&mut self, element: T) {
         self.data.push_swap_front(element);
@@ -619,13 +619,10 @@ impl<T> EnhVec<T> {
     }
 
     /// Consume the [EnhVec] and return the inner [Vec<T>].
-    pub fn into_vec(self) -> Vec<T> {
-        self.data
-            .head
-            .into_iter()
-            .rev()
-            .chain(self.data.main.into_iter())
-            .collect()
+    /// Time complexity: `O(1)` if there is nothing in the head, else `O(N)`.
+    pub fn into_vec(mut self) -> Vec<T> {
+        self.data.compact();
+        self.data.main
     }
 
     /// Length of the [EnhVec] (the sum of the lengths of the head and main [Vec]s).
@@ -1467,7 +1464,7 @@ fn sort_vec<T: Ord>(v: &mut Vec<T>, state: &SortState, desired: &Sorting) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{hash::DefaultHasher, iter::from_fn};
+    use std::{collections::VecDeque, hash::DefaultHasher, iter::from_fn};
 
     const PI_LEN: usize = 16;
     const PI_SUM: u32 = 80;
@@ -2020,6 +2017,70 @@ mod tests {
         let other: EnhVec<u32> = EnhVec::from_iter([2, XTRA]);
         assert!(small.is_proper_both(&other) && !small.is_proper_both(&big), "is_proper_both");
         assert!(small.is_proper_either(&big) && !small.is_proper_either(&other), "is_proper_either");
+    }
+
+    #[test]
+    fn test_ops_against_vecdeque() {
+        // deterministic pseudo-random operations (xorshift), checked against a VecDeque
+        let mut rng: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = |bound: usize| -> usize {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % bound as u64) as usize
+        };
+        let mut ev: EnhVec<usize> = EnhVec::new();
+        let mut model: VecDeque<usize> = VecDeque::new();
+
+        for step in 0..5000 {
+            let x: usize = next(1000);
+            match next(12) {
+                0..=2 => {
+                    ev.push(x);
+                    model.push_back(x);
+                }
+                3..=5 => {
+                    ev.push_front(x);
+                    model.push_front(x);
+                }
+                6 => assert_eq!(ev.pop(), model.pop_back(), "pop, step {step}"),
+                7 => assert_eq!(ev.pop_front(), model.pop_front(), "pop_front, step {step}"),
+                8 => {
+                    let idx: usize = next(model.len() + 1);
+                    ev.insert(idx, x);
+                    model.insert(idx, x);
+                }
+                9 => {
+                    ev.reverse();
+                    model.make_contiguous().reverse();
+                }
+                10 => {
+                    ev.sort(Sorting::Ascending);
+                    model.make_contiguous().sort();
+                }
+                _ => {
+                    ev.sort(Sorting::Descending);
+                    model.make_contiguous().sort_by(|a, b| b.cmp(a));
+                }
+            }
+            assert!(ev.iter().eq(model.iter()), "elements, step {step}");
+            assert_eq!(ev.len(), model.len(), "len, step {step}");
+            let sorted: bool = model.iter().is_sorted();
+            assert_eq!(ev.is_sorted(), sorted, "is_sorted, step {step}");
+            if !model.is_empty() {
+                let idx: usize = next(model.len());
+                assert_eq!(ev[idx], model[idx], "index {idx}, step {step}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_compact_keeps_capacity() {
+        let mut ev: EnhVec<u32> = EnhVec::new_with_capacity(1000);
+        (0..=HEAD_SIZE as u32).for_each(|x: u32| ev.push_front(x));
+        assert!(ev.data.head.len() < HEAD_SIZE, "head was compacted");
+        let capacity: usize = ev.data.main.capacity();
+        assert!(capacity >= 1000, "main capacity {capacity}");
     }
 
     #[test]

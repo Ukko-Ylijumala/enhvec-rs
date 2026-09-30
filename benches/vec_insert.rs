@@ -1,5 +1,8 @@
 extern crate criterion;
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{
+    criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup, BenchmarkId,
+    Criterion,
+};
 use std::time::Duration;
 
 const APPEND_VEC_SIZE: usize = 32;
@@ -22,43 +25,81 @@ impl TestStruct {
     }
 }
 
+fn make_usize_vec(size: usize) -> Vec<usize> {
+    (0..size).collect()
+}
+
 fn make_test_struct_vec(size: usize) -> Vec<TestStruct> {
     (0..size).map(|_| TestStruct::new(size)).collect()
 }
 
+/**
+Benchmark the ways of folding a head of `APPEND_VEC_SIZE` elements into the
+front of a main Vec, like `EnhVecInner::compact()` does. Elements are moved,
+never cloned, and building the Vecs is not part of the measurement.
+*/
+fn bench_ins_head<T>(group: &mut BenchmarkGroup<WallTime>, make_vec: fn(usize) -> Vec<T>) {
+    for &size in &TEST_VEC_SIZES {
+        let setup = || (make_vec(size), make_vec(APPEND_VEC_SIZE));
+
+        group.bench_function(BenchmarkId::new("rotate_right", size), |b| {
+            b.iter_batched(
+                setup,
+                |(mut main_vec, mut head_vec)| {
+                    main_vec.extend(head_vec.drain(..).rev());
+                    main_vec.rotate_right(APPEND_VEC_SIZE);
+                    (main_vec, head_vec)
+                },
+                BatchSize::LargeInput,
+            );
+        });
+
+        group.bench_function(BenchmarkId::new("new_alloc", size), |b| {
+            b.iter_batched(
+                setup,
+                |(mut main_vec, mut head_vec)| {
+                    let mut new_vec: Vec<T> = Vec::with_capacity(main_vec.len() + head_vec.len());
+                    new_vec.extend(head_vec.drain(..).rev());
+                    new_vec.append(&mut main_vec);
+                    (new_vec, head_vec)
+                },
+                BatchSize::LargeInput,
+            );
+        });
+
+        group.bench_function(BenchmarkId::new("splice", size), |b| {
+            b.iter_batched(
+                setup,
+                |(mut main_vec, mut head_vec)| {
+                    main_vec.splice(0..0, head_vec.drain(..).rev());
+                    (main_vec, head_vec)
+                },
+                BatchSize::LargeInput,
+            );
+        });
+
+        // the main Vec usually has some spare capacity, which splice() can use
+        let setup_spare = || {
+            let (mut main_vec, head_vec) = setup();
+            main_vec.reserve(APPEND_VEC_SIZE);
+            (main_vec, head_vec)
+        };
+        group.bench_function(BenchmarkId::new("splice_spare_capacity", size), |b| {
+            b.iter_batched(
+                setup_spare,
+                |(mut main_vec, mut head_vec)| {
+                    main_vec.splice(0..0, head_vec.drain(..).rev());
+                    (main_vec, head_vec)
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+}
+
 fn bench_ins_usize(c: &mut Criterion) {
     let mut group = c.benchmark_group("ins_head_usize");
-    let test_vec: Vec<usize> = (0..APPEND_VEC_SIZE).collect();
-
-    for &size in &TEST_VEC_SIZES {
-        group.bench_with_input(
-            BenchmarkId::new("rotate_right", size),
-            &size,
-            |b, &size| {
-                b.iter(|| {
-                    let mut main_vec: Vec<usize> = (0..size).collect();
-                    main_vec.extend(test_vec.iter());
-                    main_vec.rotate_right(APPEND_VEC_SIZE);
-                    main_vec
-                });
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("new_alloc", size),
-            &size,
-            |b, &size| {
-                b.iter(|| {
-                    let main_vec: Vec<usize> = (0..size).collect();
-                    let mut new_vec: Vec<usize> = Vec::with_capacity(size + APPEND_VEC_SIZE);
-                    new_vec.extend_from_slice(&test_vec);
-                    new_vec.extend_from_slice(&main_vec);
-                    drop(main_vec);
-                    new_vec
-                });
-            },
-        );
-    }
+    bench_ins_head(&mut group, make_usize_vec);
     group.finish();
 }
 
@@ -66,38 +107,7 @@ fn bench_ins_struct(c: &mut Criterion) {
     let mut group = c.benchmark_group("ins_head_struct");
     group.measurement_time(Duration::from_secs(10));
     group.sample_size(100);
-    let test_vec: Vec<TestStruct> = make_test_struct_vec(APPEND_VEC_SIZE);
-
-    for &size in &TEST_VEC_SIZES {
-        group.bench_with_input(
-            BenchmarkId::new("rotate_right", size),
-            &size,
-            |b, &size| {
-                b.iter(|| {
-                    let mut main_vec: Vec<TestStruct> = make_test_struct_vec(size);
-                    main_vec.extend(test_vec.clone());
-                    main_vec.rotate_right(APPEND_VEC_SIZE);
-                    main_vec
-                });
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("new_alloc", size),
-            &size,
-            |b, &size| {
-                b.iter(|| {
-                    let main_vec: Vec<TestStruct> = make_test_struct_vec(size);
-                    let mut new_vec: Vec<TestStruct> =
-                        Vec::with_capacity(size + APPEND_VEC_SIZE);
-                    new_vec.extend_from_slice(&test_vec);
-                    new_vec.extend_from_slice(&main_vec);
-                    drop(main_vec);
-                    new_vec
-                });
-            },
-        );
-    }
+    bench_ins_head(&mut group, make_test_struct_vec);
     group.finish();
 }
 
