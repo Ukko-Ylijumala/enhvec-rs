@@ -197,7 +197,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
-- Unreleased: Vec methods that keep a known order
+- 0.6.2: Vec methods that keep a known order
     - `remove()`, `truncate()`, `clear()`, `retain()`, `dedup()`, `drain()` and `split_off()`
 - 0.6.1: Slice API, faster lookups in a known order, `sort_fp()`
     - `Deref`/`DerefMut` to `[T]`, `AsMut<[T]>`, indexing with ranges, `binary_search()` in the known order
