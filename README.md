@@ -90,6 +90,17 @@ required, so these are `O(N * M)`.
 Any two non-empty sets are in exactly one of these relations: equal, proper subset, proper
 superset, disjoint or partial overlap.
 
+For larger data, compute a `SetRelation` once and check any of the predicates above on it:
+
+- `set_relation()`: `PartialEq` only, `O(N * M)`
+- `set_relation_hashed()`: for `Eq + Hash` types, expected `O(N + M)`
+- `set_relation_sorted()`: for `Ord` types, `O(N + M)` if both orders are known, else `O(N log N + M log M)`
+
+```rust
+let rel = a.set_relation_hashed(&b);
+if rel.is_proper_subset() || rel.is_partial_overlap() { /* ... */ }
+```
+
 ### Statistical Operations (Numeric Types)
 
 - Basic: `sum()`, `average()`, `product()`, `range()`
@@ -132,6 +143,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
     - `Default` no longer requires `T: Default`, `sort_by()` no longer requires `Ord` (e.g. `sort_by(f64::total_cmp)`)
     - Deterministic `mode()` ties and `distinct()` order, no overflow in `average_fp()`
     - `Extend` (also from `&T`), double-ended, fused and cloneable iterators
+    - `SetRelation` via `set_relation()`, `set_relation_hashed()` and `set_relation_sorted()`: all set predicates from one pass, in `O(N + M)` for hashable or sorted data
     - Breaking: `range()` is for `Integer` types and returns `None` if the range does not fit, `Integer`/`Float` have new required methods
 - 0.5.0: Correctness and performance pass
     - Fix element order corruption in `compact()`, `insert()`, `reverse()`, `pop_front()` and `insert_sorted()`, and a panic in `insert_sorted()`

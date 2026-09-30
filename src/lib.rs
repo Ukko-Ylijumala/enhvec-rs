@@ -798,12 +798,20 @@ impl<T: Ord> EnhVec<T> {
         match self.data.state {
             SortState::Asc => self.data.internal_iter().for_each(f),
             SortState::Desc => self.data.internal_iter().rev().for_each(f),
-            _ => {
-                let mut refs: Vec<&T> = self.as_ref_vec();
-                refs.sort_unstable();
-                refs.into_iter().for_each(f)
-            }
+            _ => self.asc_refs().into_iter().for_each(f),
         }
+    }
+
+    /// References to the elements in ASCending order, sorted only if the order
+    /// is not known. Equal elements come in no particular order.
+    fn asc_refs(&self) -> Vec<&T> {
+        let mut refs: Vec<&T> = self.as_ref_vec();
+        match self.data.state {
+            SortState::Asc => {}
+            SortState::Desc => refs.reverse(),
+            _ => refs.sort_unstable(),
+        }
+        refs
     }
 }
 
@@ -889,6 +897,139 @@ impl<T: PartialEq> EnhVec<T> {
     #[deprecated(note = "same as is_proper()")]
     pub fn is_proper_either(&self, other: &Self) -> bool {
         self.is_proper(other)
+    }
+
+    /**
+    How this and another [EnhVec] relate as sets, see [SetRelation].
+    Time complexity: `O(N * M)`, as only [PartialEq] is available. See
+    `set_relation_hashed()` and `set_relation_sorted()` for faster ones.
+    */
+    pub fn set_relation(&self, other: &Self) -> SetRelation {
+        let mut rel: SetRelation = SetRelation::default();
+        for x in self.data.internal_iter() {
+            match other.contains(x) {
+                true => rel.shared = true,
+                false => rel.left_only = true,
+            }
+            if rel.shared && rel.left_only {
+                break;
+            }
+        }
+        rel.right_only = !self.contains_all(other);
+        rel
+    }
+}
+
+/* --------------------------------- */
+
+/**
+How two [EnhVec]s (`self` and `other`, the "left" and the "right" one) relate
+as sets of values, ignoring order and duplicates. It is computed in one go by
+`set_relation()`, `set_relation_hashed()` or `set_relation_sorted()`, after
+which any of the set predicates can be checked for free.
+
+The predicates match the [EnhVec] methods of the same name, e.g.
+`a.set_relation_hashed(&b).is_subset() == a.is_subset(&b)`.
+*/
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SetRelation {
+    /// Some value is in both.
+    shared: bool,
+    /// Some value is only in the left one.
+    left_only: bool,
+    /// Some value is only in the right one.
+    right_only: bool,
+}
+
+impl SetRelation {
+    /// All values of the left one are in the right one.
+    pub fn is_subset(&self) -> bool {
+        !self.left_only
+    }
+    /// All values of the right one are in the left one.
+    pub fn is_superset(&self) -> bool {
+        !self.right_only
+    }
+    /// Same set of values.
+    pub fn is_equal(&self) -> bool {
+        !self.left_only && !self.right_only
+    }
+    /// No values in common.
+    pub fn is_disjoint(&self) -> bool {
+        !self.shared
+    }
+    /// A subset lacking at least one of the right one's values.
+    pub fn is_proper_subset(&self) -> bool {
+        !self.left_only && self.right_only
+    }
+    /// A superset with at least one value the right one lacks.
+    pub fn is_proper_superset(&self) -> bool {
+        self.left_only && !self.right_only
+    }
+    /// A proper subset or superset.
+    pub fn is_proper(&self) -> bool {
+        self.left_only != self.right_only
+    }
+    /// Some values in common, but both also have values the other one lacks.
+    pub fn is_partial_overlap(&self) -> bool {
+        self.shared && self.left_only && self.right_only
+    }
+}
+
+impl<T: Eq + Hash> EnhVec<T> {
+    /**
+    How this and another [EnhVec] relate as sets, see [SetRelation].
+    Time complexity: expected `O(N + M)`, plus building a [HashSet] of each.
+    */
+    pub fn set_relation_hashed(&self, other: &Self) -> SetRelation {
+        let left: HashSet<&T> = self.data.internal_iter().collect();
+        let right: HashSet<&T> = other.data.internal_iter().collect();
+        let shared: usize = left.iter().filter(|&x| right.contains(x)).count();
+        SetRelation {
+            shared: shared > 0,
+            left_only: shared < left.len(),
+            right_only: shared < right.len(),
+        }
+    }
+}
+
+impl<T: Ord> EnhVec<T> {
+    /**
+    How this and another [EnhVec] relate as sets, see [SetRelation], by
+    merging the sorted values. Time complexity: `O(N + M)` if the order of
+    both is known (ASC or DESC), else `O(N log N + M log M)`. No hashing.
+    */
+    pub fn set_relation_sorted(&self, other: &Self) -> SetRelation {
+        let (left, right): (Vec<&T>, Vec<&T>) = (self.asc_refs(), other.asc_refs());
+        let mut rel: SetRelation = SetRelation::default();
+        let (mut i, mut j): (usize, usize) = (0, 0);
+        // stop early once all is known
+        while i < left.len() && j < right.len() && !rel.is_partial_overlap() {
+            match left[i].cmp(right[j]) {
+                Ordering::Less => {
+                    rel.left_only = true;
+                    i += 1;
+                }
+                Ordering::Greater => {
+                    rel.right_only = true;
+                    j += 1;
+                }
+                Ordering::Equal => {
+                    rel.shared = true;
+                    // skip the duplicates of this value on both sides
+                    let value: &T = left[i];
+                    while i < left.len() && left[i] == value {
+                        i += 1;
+                    }
+                    while j < right.len() && right[j] == value {
+                        j += 1;
+                    }
+                }
+            }
+        }
+        rel.left_only |= i < left.len();
+        rel.right_only |= j < right.len();
+        rel
     }
 }
 
@@ -2338,6 +2479,42 @@ mod tests {
         ev.extend(&[5, 6]);
         ev.extend([7].iter());
         assert_eq!(ev.to_vec(), vec![1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_set_relation() {
+        let data: [&[u32]; 9] = [
+            &[], &[1], &[1, 1, 2], &[2, 1], &[3, 2, 1], &[2, XTRA], &[1, 1, 1], &[4, 5], &[5, 5, 4],
+        ];
+        // every combination, with unknown, ASC and DESC order
+        let mut vecs: Vec<EnhVec<u32>> = Vec::new();
+        for values in data {
+            let ev: EnhVec<u32> = EnhVec::from_iter(values.iter().copied());
+            let (mut asc, mut desc): (EnhVec<u32>, EnhVec<u32>) = (ev.clone(), ev.clone());
+            asc.sort(Sorting::Ascending);
+            desc.sort(Sorting::Descending);
+            vecs.extend([ev, asc, desc]);
+        }
+
+        for (a, b) in vecs.iter().flat_map(|a| vecs.iter().map(move |b| (a, b))) {
+            let msg: String = format!("{:?} vs {:?}", a.to_vec(), b.to_vec());
+            let rel: SetRelation = a.set_relation(b);
+            assert_eq!(a.set_relation_hashed(b), rel, "hashed, {msg}");
+            assert_eq!(a.set_relation_sorted(b), rel, "sorted, {msg}");
+
+            let expected: [bool; 8] = [
+                a.is_subset(b), a.is_superset(b), a.is_equal(b), a.is_disjoint(b),
+                a.is_proper_subset(b), a.is_proper_superset(b), a.is_proper(b),
+                a.is_partial_overlap(b),
+            ];
+            let found: [bool; 8] = [
+                rel.is_subset(), rel.is_superset(), rel.is_equal(), rel.is_disjoint(),
+                rel.is_proper_subset(), rel.is_proper_superset(), rel.is_proper(),
+                rel.is_partial_overlap(),
+            ];
+            assert_eq!(found, expected, "predicates, {msg}");
+        }
     }
 
     #[test]
