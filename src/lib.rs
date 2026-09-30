@@ -812,34 +812,39 @@ impl<T: PartialEq> EnhVec<T> {
     }
     /// Check if the [EnhVec] contains only values in another [EnhVec].
     pub fn contains_only(&self, other: &Self) -> bool {
-        self.contains_all(other) && self.len() == other.len()
+        other.contains_all(self)
     }
 
-    /// Check if the [EnhVec] is a subset of another [EnhVec].
+    /// Check if the [EnhVec] is a subset of another [EnhVec], ie. all of its
+    /// values are in the other one. Order and duplicates are ignored.
     pub fn is_subset(&self, other: &Self) -> bool {
-        self.contains_all(other)
+        self.contains_only(other)
     }
-    /// Check if the [EnhVec] is a superset of another [EnhVec].
+    /// Check if the [EnhVec] is a superset of another [EnhVec], ie. all of
+    /// the other one's values are in it. Order and duplicates are ignored.
     pub fn is_superset(&self, other: &Self) -> bool {
-        self.contains_any(other)
+        self.contains_all(other)
     }
     /// Check if the [EnhVec] is disjoint with another [EnhVec].
     pub fn is_disjoint(&self, other: &Self) -> bool {
         !self.contains_any(other)
     }
-    /// Check if the [EnhVec] is equal to another [EnhVec].
+    /// Check if the [EnhVec] has the same set of values as another [EnhVec].
+    /// Unlike with `==`, order and duplicates are ignored.
     pub fn is_equal(&self, other: &Self) -> bool {
-        self.contains_only(other)
+        self.is_subset(other) && self.is_superset(other)
     }
 
-    /// Check if the [EnhVec] is a proper subset of another [EnhVec].
+    /// Check if the [EnhVec] is a proper subset of another [EnhVec], ie.
+    /// a subset lacking at least one of the other one's values.
     pub fn is_proper_subset(&self, other: &Self) -> bool {
-        self.is_subset(other) && self.len() < other.len()
+        self.is_subset(other) && !self.is_superset(other)
     }
 
-    /// Check if the [EnhVec] is a proper superset of another [EnhVec].
+    /// Check if the [EnhVec] is a proper superset of another [EnhVec], ie.
+    /// a superset with at least one value the other one lacks.
     pub fn is_proper_superset(&self, other: &Self) -> bool {
-        self.is_superset(other) && self.len() > other.len()
+        self.is_superset(other) && !self.is_subset(other)
     }
     /// Check if the [EnhVec] is a proper subset or superset of another [EnhVec].
     pub fn is_proper(&self, other: &Self) -> bool {
@@ -1897,5 +1902,28 @@ mod tests {
         ev.sort(Sorting::Ascending);
         assert_eq!(ev.len(), 2 * PI_LEN, "sort() after extend()");
         assert!(ev.is_sorted(), "sort() after extend()");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_set_operations() {
+        let small: EnhVec<u32> = EnhVec::from_iter([1, 2]);
+        let big: EnhVec<u32> = EnhVec::from_iter([3, 2, 1]);
+        let dups: EnhVec<u32> = EnhVec::from_iter([2, 1, 2, 1, 1]);
+        let other: EnhVec<u32> = EnhVec::from_iter([2, XTRA]);
+        let ones: EnhVec<u32> = EnhVec::from_iter([1, 1, 1]);
+
+        assert!(big.contains_all(&small) && !small.contains_all(&big), "contains_all");
+        assert!(ones.contains_only(&big) && !big.contains_only(&ones), "contains_only");
+        assert!(small.is_subset(&big) && !big.is_subset(&small), "is_subset");
+        assert!(big.is_superset(&small) && !small.is_superset(&big), "is_superset");
+        assert!(!small.is_superset(&other) && !small.is_subset(&other), "partial overlap");
+        assert!(!small.is_disjoint(&other) && ones.is_disjoint(&other), "is_disjoint");
+        assert!(small.is_equal(&dups) && dups.is_equal(&small), "is_equal ignores duplicates");
+        assert!(!big.is_equal(&ones) && !ones.is_equal(&big), "is_equal");
+        assert!(small.is_proper_subset(&big) && !small.is_proper_subset(&dups), "is_proper_subset");
+        assert!(big.is_proper_superset(&small) && !dups.is_proper_superset(&small), "is_proper_superset");
+        assert!(small.is_proper(&big) && big.is_proper(&small), "is_proper");
+        assert!(!small.is_proper(&other) && !small.is_proper(&dups), "is_proper");
     }
 }
