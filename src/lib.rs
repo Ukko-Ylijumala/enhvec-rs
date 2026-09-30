@@ -273,22 +273,35 @@ impl<T> IndexMut<usize> for EnhVecInner<T> {
 impl<T: PartialOrd> EnhVecInner<T> {
     /// Whether the [EnhVecInner] data is sorted in ascending order.
     fn is_sorted(&self) -> bool {
+        self.is_sorted_in(SortState::Asc)
+    }
+
+    /// Whether the [EnhVecInner] data is sorted in descending order.
+    fn is_sorted_desc(&self) -> bool {
+        self.is_sorted_in(SortState::Desc)
+    }
+
+    /// Whether the data is sorted in the given `order` (ASC or DESC).
+    fn is_sorted_in(&self, order: SortState) -> bool {
+        // whether `a` may precede `b` in the requested order
+        let desc: bool = order == SortState::Desc;
+        let in_order = |a: &T, b: &T| if desc { a >= b } else { a <= b };
         match self.len() {
             0 | 1 => return true,
-            2 => return self[0] <= self[1],
+            2 => return in_order(&self[0], &self[1]),
             _ => {}
         }
-        if self.state == SortState::Asc {
+        if self.state == order {
             // short circuit if already sorted
             return true;
         }
-        if (self.first().unwrap()).gt(&self.last().unwrap()) {
-            // short circuit if first > last
+        if !in_order(self.first().unwrap(), self.last().unwrap()) {
+            // short circuit if first and last are out of order
             return false;
         }
         self.internal_iter()
             .zip(self.internal_iter().skip(1))
-            .all(|(a, b)| a <= b)
+            .all(|(a, b)| in_order(a, b))
 
         // TODO: check if this is faster than the iter().skip(1)
         // above for large Vecs and optimize accordingly
@@ -386,18 +399,33 @@ impl<T: Ord> EnhVecInner<T> {
         self.main.sort_by(f);
     }
 
+    /**
+    Insert an element into its sorted position. The data must be known to
+    be sorted (state ASC or DESC), and the element is inserted in that order,
+    after any equal elements.
+    */
     fn insert_sorted(&mut self, element: T) {
+        debug_assert!(self.state.is_sorted());
+        // whether `a` belongs strictly before `b` in the current order
+        let desc: bool = self.state == SortState::Desc;
+        let before = |a: &T, b: &T| if desc { a > b } else { a < b };
+
         // short circuit some common cases
-        if self.is_empty() || element >= *self.main.last().unwrap() {
+        if self.last().is_none_or(|last: &T| !before(&element, last)) {
             self.main.push(element);
             return;
         }
-        if !self.head.is_empty() && element <= *self.head.last().unwrap() {
-            // head.last() is the smallest element since head is reversed
+        if self.first().is_some_and(|x: &T| !before(x, &element)) {
+            // head.last() is the first element since head is reversed
             self.head.push(element);
             return;
         }
-        if !self.main.is_empty() && element <= *self.main.first().unwrap() {
+        let fits_between: bool = match (self.head.first(), self.main.first()) {
+            (Some(h), Some(m)) => !before(&element, h) && !before(m, &element),
+            _ => false,
+        };
+        if fits_between {
+            // head[0] is the last head element, right before main[0]
             self.head.insert(0, element);
             return;
         }
@@ -408,12 +436,10 @@ impl<T: Ord> EnhVecInner<T> {
             // linear search for "small" vectors
             true => self
                 .internal_iter()
-                .position(|x: &T| element < *x)
+                .position(|x: &T| before(&element, x))
                 .unwrap_or(self.main.len()),
             // binary search for larger vectors
-            false => match self.main.binary_search(&element) {
-                Ok(index) | Err(index) => index,
-            },
+            false => self.main.partition_point(|x: &T| !before(&element, x)),
         };
         self.main.insert(idx, element);
     }
@@ -692,19 +718,29 @@ impl<T: Ord> EnhVec<T> {
     NOTE: data must be sorted ASC or DESC for this insert to make much sense.
     If the data is not sorted, the insertion point would be more or less
     random, hence in this case we just `push()` the element to the end.
+    Data that is sorted both ways (all elements equal) follows the [Sorting]
+    given to `sort()` or `new_sorted()`, defaulting to ASC.
 
-    NOTE: this method is potentially slow, as it might traverse the data twice:
-    once to check if it is sorted (worst case: `O(N)`), and once to find the
-    insertion point (`O(log n)`). This may be be optimized in the future.
+    NOTE: if the order is not already known, it is verified first (worst case:
+    `O(N)`) and then remembered, so consecutive calls only have to find the
+    insertion point (`O(log n)`) and shift the elements after it.
 
     NOTE: if you need to add many elements, it will likely be faster to push()
     and finally sort() after all the insertions are done, as sorting is approx.
     `O(N log N)`.
     */
     pub fn insert_sorted(&mut self, element: T) {
-        if !self.data.is_sorted() {
-            self.push(element);
-            return;
+        if self.data.state.is_unsorted() {
+            let state: SortState = match (self.data.is_sorted(), self.data.is_sorted_desc()) {
+                (true, true) if self.sort == Sorting::Descending => SortState::Desc,
+                (true, _) => SortState::Asc,
+                (false, true) => SortState::Desc,
+                (false, false) => {
+                    self.push(element);
+                    return;
+                }
+            };
+            self.data.state = state;
         }
         self.data.insert_sorted(element);
     }
@@ -1739,5 +1775,64 @@ mod tests {
         ev.sort(Sorting::Ascending);
         let popped: Vec<u32> = from_fn(|| ev.swap_pop_front()).collect();
         assert_eq!(popped, Vec::from_iter(PI_ASC), "sorted: order kept");
+    }
+
+    #[test]
+    fn test_insert_sorted_head() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter([7, 9]);
+        ev.insert_sorted(5); // new first element
+        ev.insert_sorted(6); // between head and main
+        ev.insert_sorted(3); // new first element
+        ev.insert_sorted(4); // < main[0], but also < the last head element
+        assert_eq!(ev.to_vec(), vec![3, 4, 5, 6, 7, 9]);
+
+        // all elements in the head, main is empty
+        let mut ev: EnhVec<u32> = EnhVec::new();
+        ev.push_front(5);
+        ev.insert_sorted(3);
+        ev.insert_sorted(4);
+        ev.insert_sorted(XTRA);
+        assert_eq!(ev.to_vec(), vec![3, 4, 5, XTRA]);
+    }
+
+    #[test]
+    fn test_insert_sorted_many() {
+        // deterministic pseudo-random values with duplicates, enough for binary search
+        let values: Vec<u32> = (0..200).map(|i: u32| (i * 7919) % 101).collect();
+        let mut asc: EnhVec<u32> = EnhVec::new();
+        let mut desc: EnhVec<u32> = EnhVec::new_sorted(Sorting::Descending);
+        values.iter().for_each(|&x: &u32| {
+            asc.insert_sorted(x);
+            desc.insert_sorted(x);
+        });
+
+        let mut test: Vec<u32> = values.clone();
+        test.sort();
+        assert_eq!(asc.to_vec(), test, "ASC");
+        test.reverse();
+        assert_eq!(desc.to_vec(), test, "DESC");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_insert_sorted_desc() {
+        let mut ev: EnhVec<i32> = EnhVec::from_iter([5]);
+        ev.sort(Sorting::Descending);
+        ev.insert_sorted(7);
+        assert_eq!(ev.to_vec(), vec![7, 5], "DESC state, 1 element");
+        assert_eq!(ev.percentile(0.0), Some(5), "DESC state, 1 element: min");
+
+        let mut ev: EnhVec<i32> = EnhVec::from_iter([2, 2, 2]);
+        ev.sort(Sorting::Descending);
+        ev.insert_sorted(5);
+        ev.insert_sorted(1);
+        assert_eq!(ev.to_vec(), vec![5, 2, 2, 2, 1], "DESC state, all equal");
+        assert_eq!(ev.as_sorted_desc(), vec![&5, &2, &2, &2, &1], "DESC state, all equal");
+
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(PI_DESC);
+        ev.insert_sorted(4);
+        let mut test: Vec<u32> = Vec::from_iter(PI_DESC);
+        test.insert(10, 4);
+        assert_eq!(ev.to_vec(), test, "DESC data, unknown state");
     }
 }
