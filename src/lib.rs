@@ -123,12 +123,14 @@ impl<T> HeadBuf<T> {
         unsafe { slice::from_raw_parts_mut(self.buf.as_mut_ptr().add(self.start).cast(), len) }
     }
 
+    #[inline]
     fn push_front(&mut self, element: T) {
         if self.start == 0 {
             self.make_room(1, true);
         }
-        self.buf[self.start - 1].write(element);
         self.start -= 1;
+        // SAFETY: start was > 0 and <= buf.len(), and nothing can panic in between
+        unsafe { self.buf.get_unchecked_mut(self.start).write(element) };
     }
 
     fn push_back(&mut self, element: T) {
