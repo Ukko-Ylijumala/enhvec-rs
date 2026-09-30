@@ -241,6 +241,26 @@ impl<T> EnhVecInner<T> {
     }
 
     /**
+    Even out head and main when one holds less than a quarter of what the
+    other does, by moving elements over at the junction. An insert then
+    shifts at most about half of the elements, like VecDeque shifting its
+    shorter side: in the head (stored reversed) those before the position,
+    in main those after it. The moves are amortized over the inserts.
+    */
+    fn balance(&mut self) {
+        let (head_len, main_len): (usize, usize) = (self.head.len(), self.main.len());
+        if 4 * head_len < main_len {
+            // the front of main continues the head, whose logical end is head[0]
+            let k: usize = (main_len - head_len) / 2;
+            self.head.splice(0..0, self.main.drain(..k).rev());
+        } else if 4 * main_len < head_len {
+            // head[..k] are the last k head elements, stored reversed
+            let k: usize = (head_len - main_len) / 2;
+            self.main.splice(0..0, self.head.drain(..k).rev());
+        }
+    }
+
+    /**
     Whether logical `index` is in the head, and its position in that Vec.
     Written so that the Vec is picked with a conditional move instead of a
     jump, which the CPU would mispredict when reads hit head and main at
@@ -352,13 +372,10 @@ impl<T: PartialOrd> EnhVecInner<T> {
 
     /// Inserts into the head or main Vec, depending on the index.
     fn insert(&mut self, idx: usize, element: T) {
+        self.balance();
         let head_len: usize = self.head.len();
         if idx < head_len {
-            /*
-            insert into the head Vec even if it's "full", since this likely
-            saves some extra work now and we can always compact it later.
-            Head is reversed: position `head_len - idx` ends up at `idx`.
-            */
+            // head is reversed: position `head_len - idx` ends up at `idx`
             self.head.insert(head_len - idx, element);
         } else {
             // insert into the main Vec
@@ -450,28 +467,17 @@ impl<T: Ord> EnhVecInner<T> {
             self.head.push(element);
             return;
         }
-        let fits_between: bool = match (self.head.first(), self.main.first()) {
-            (Some(h), Some(m)) => !before(&element, h) && !before(m, &element),
-            _ => false,
-        };
-        if fits_between {
-            // head[0] is the last head element, right before main[0]
-            self.head.insert(0, element);
-            return;
-        }
 
-        // fold head into main and determine the insertion point
-        self.compact();
-        let idx: usize = match self.main.len() < SEARCH_SIZE_CUTOFF {
-            // linear search for "small" vectors
-            true => self
-                .internal_iter()
-                .position(|x: &T| before(&element, x))
-                .unwrap_or(self.main.len()),
-            // binary search for larger vectors
-            false => self.main.partition_point(|x: &T| !before(&element, x)),
-        };
-        self.main.insert(idx, element);
+        // insert into the side holding the position (see balance())
+        self.balance();
+        if self.main.first().is_none_or(|m: &T| before(&element, m)) {
+            // the head is stored reversed: the elements to follow come first
+            let pos: usize = partition_idx(&self.head, |x: &T| before(&element, x));
+            self.head.insert(pos, element);
+        } else {
+            let pos: usize = partition_idx(&self.main, |x: &T| !before(&element, x));
+            self.main.insert(pos, element);
+        }
     }
 }
 
@@ -546,7 +552,8 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
         }
     }
 
-    /// Insert an element at index. Possibly slow, as it may shift other elements.
+    /// Insert an element at index. Shifts up to about half of the elements, like
+    /// VecDeque: the head/main split is rebalanced if needed.
     pub fn insert(&mut self, idx: usize, element: T) {
         self.data.insert(idx, element);
     }
@@ -767,7 +774,8 @@ impl<T: Ord> EnhVec<T> {
 
     NOTE: if the order is not already known, it is verified first (worst case:
     `O(N)`) and then remembered, so consecutive calls only have to find the
-    insertion point (`O(log n)`) and shift the elements after it.
+    insertion point (`O(log n)`) and shift up to about half of the elements,
+    like `insert()`.
 
     NOTE: if you need to add many elements, it will likely be faster to push()
     and finally sort() after all the insertions are done, as sorting is approx.
@@ -1717,6 +1725,15 @@ impl_float!(f32, f64);
 
 /* ########################### Utility functions ########################### */
 
+/// The index of the first element of `v` for which `pred` is false, `v` being
+/// partitioned by it. Linear search for small slices, binary for larger ones.
+fn partition_idx<T>(v: &[T], mut pred: impl FnMut(&T) -> bool) -> usize {
+    match v.len() < SEARCH_SIZE_CUTOFF {
+        true => v.iter().position(|x: &T| !pred(x)).unwrap_or(v.len()),
+        false => v.partition_point(pred),
+    }
+}
+
 /**
 The element a full sort of `v` by `cmp` would put at `idx`, and if `with_next`,
 the one it would put right after it. Reorders `v`. Time complexity: `O(N)`.
@@ -2193,7 +2210,7 @@ mod tests {
     #[test]
     fn test_insert_sorted_many() {
         // deterministic pseudo-random values with duplicates, enough for binary search
-        let values: Vec<u32> = (0..200).map(|i: u32| (i * 7919) % 101).collect();
+        let values: Vec<u32> = (0..2000).map(|i: u32| (i * 7919) % 1009).collect();
         let mut asc: EnhVec<u32> = EnhVec::new();
         let mut desc: EnhVec<u32> = EnhVec::new_sorted(Sorting::Descending);
         values.iter().for_each(|&x: &u32| {
@@ -2354,7 +2371,7 @@ mod tests {
 
         for step in 0..5000 {
             let x: usize = next(1000);
-            match next(12) {
+            match next(13) {
                 0..=2 => {
                     ev.push(x);
                     model.push_back(x);
@@ -2377,6 +2394,14 @@ mod tests {
                 10 => {
                     ev.sort(Sorting::Ascending);
                     model.make_contiguous().sort();
+                }
+                11 if ev.data.state == SortState::Asc => {
+                    ev.insert_sorted(x);
+                    model.insert(model.partition_point(|&y: &usize| y <= x), x);
+                }
+                11 => {
+                    ev.push(x);
+                    model.push_back(x);
                 }
                 _ => {
                     ev.sort(Sorting::Descending);

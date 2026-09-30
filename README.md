@@ -128,10 +128,14 @@ half of the elements are moved over from the other one. Sorting and sorted inser
 single contiguous Vec, and a known sort order makes e.g. re-sorting, `median()` and `range()`
 `O(1)`.
 
+Inserts in the middle rebalance head and main when needed, so that like with `VecDeque` they
+shift at most about half of the elements.
+
 `benches/vs_std.rs` compares it to `Vec` and `VecDeque` on common operations. Roughly: pushes,
-pops and queues at either end are on par with `VecDeque` (often faster), random indexing is a bit
-slower than both, and sorted inserts shift the whole tail like `Vec` does (`VecDeque` shifts the
-shorter side, about 2x faster). Run it with e.g. `cargo bench --bench vs_std -- pop_front`.
+pops, queues and sorted inserts are on par with `VecDeque` (often faster). Random indexing is a
+bit slower than both (picking head or main costs an extra load), and `into_vec()` of data pushed
+at both ends must copy it into one new allocation, where `VecDeque` can rearrange in place. Run it
+with e.g. `cargo bench --bench vs_std -- pop_front`.
 
 ## Type Support
 
@@ -154,6 +158,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 - Unreleased
     - Amortized `O(1)` `pop_front()` and `pop()` in any mix (two-stack deque), faster indexing and pushes, `benches/vs_std.rs`
+    - `insert()`/`insert_sorted()` shift at most about half of the elements (head/main rebalancing)
 - 0.5.1: Minor fixes, API gaps and faster set operations
     - `Default` no longer requires `T: Default`, `sort_by()` no longer requires `Ord` (e.g. `sort_by(f64::total_cmp)`)
     - Deterministic `mode()` ties and `distinct()` order, no overflow in `average_fp()`
