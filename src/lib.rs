@@ -181,12 +181,6 @@ impl<T> EnhVecInner<T> {
             return;
         }
 
-        if self.state == SortState::Desc {
-            // the head Vec is already in the correct order
-            self.main.extend(self.head.drain(..));
-            return;
-        }
-
         let main_len: usize = self.main.len();
         if main_len < LARGE_VEC_THRESHOLD {
             // reallocate if the main Vec is small
@@ -1646,5 +1640,18 @@ mod tests {
         assert_eq!(ev.percentile(0.50), Some(purpose), "percentile 0.50");
         assert_eq!(ev.percentile(0.99), Some(purpose), "percentile 0.99");
         assert!(ev.is_sorted(), "is_sorted");
+    }
+
+    #[test]
+    fn test_push_front_compact_desc() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter([3, 2, 1]);
+        ev.sort(Sorting::Descending);
+        // every push keeps the DESC order, the last one folds the full head into main
+        let top: u32 = 4 + HEAD_SIZE as u32;
+        (4..=top).for_each(|x: u32| ev.push_front(x));
+
+        let test: Vec<u32> = (1..=top).rev().collect();
+        assert_eq!(ev.to_vec(), test);
+        assert_eq!(ev.as_sorted_desc(), test.iter().collect::<Vec<&u32>>());
     }
 }
