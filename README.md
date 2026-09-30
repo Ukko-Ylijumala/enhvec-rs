@@ -204,7 +204,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
-- Unreleased: Capacity control, `extend_from_slice()`
+- 0.6.3: Capacity control, `extend_from_slice()`
     - `capacity()`, `reserve()`, `reserve_front()`, `shrink_to_fit()`, and `extend_from_slice()` as fast as `Vec`'s
 - 0.6.2: Vec methods that keep a known order
     - `remove()`, `truncate()`, `clear()`, `retain()`, `dedup()`, `drain()` and `split_off()`
