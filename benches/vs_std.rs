@@ -8,11 +8,13 @@ Each group is one operation, with a benchmark per container and size, e.g.
 `push_front/VecDeque/10000`. Cases that are quadratic for a container (e.g.
 `Vec::insert(0, x)`) only run up to `QUADRATIC_MAX` elements. Run a subset
 with e.g. `cargo bench --bench vs_std -- pop_front`.
+
+With glibc, freed memory is kept in the process (see `keep_freed_memory()`),
+so that the results show the work of the containers, not page faults.
 */
 
 use criterion::{
-    criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup, BenchmarkId,
-    Criterion,
+    criterion_group, measurement::WallTime, BatchSize, BenchmarkGroup, BenchmarkId, Criterion,
 };
 use enhvec::{EnhVec, Sorting};
 use std::{collections::VecDeque, iter::from_fn, mem, time::Duration};
@@ -493,5 +495,32 @@ fn sorting(c: &mut Criterion) {
     });
 }
 
+/**
+Keep freed memory in the process, for reuse: no trimming of the heap, and no
+separate mappings for large blocks, which glibc would unmap again when they
+are freed. Criterion frees each batch of inputs after timing it, and glibc
+by default returns much of that memory to the OS, adjusting its thresholds
+as blocks come and go. The benchmarks that build up data then spend ~2/3 of
+their time in page faults on fresh memory (for Vec and VecDeque too), and
+the results swing with how each allocation pattern meets those thresholds.
+*/
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn keep_freed_memory() {
+    const LIMIT: libc::c_int = 1 << 30;
+    // SAFETY: only sets malloc parameters, before anything is benchmarked
+    let ok: bool = unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, LIMIT) == 1
+            && libc::mallopt(libc::M_TRIM_THRESHOLD, LIMIT) == 1
+    };
+    assert!(ok, "mallopt() failed");
+}
+
 criterion_group!(benches, pushes, pops, access, sorting);
-criterion_main!(benches);
+
+// criterion_main!(benches), with malloc set up first
+fn main() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    keep_freed_memory();
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}
