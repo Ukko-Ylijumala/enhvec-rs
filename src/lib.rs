@@ -335,11 +335,14 @@ impl<T: Debug> Debug for DeBuf<T> {
 struct EnhVecInner<T> {
     state: SortState,
     /**
-    `T::cmp`, kept by the methods that set a known order (ASC or DESC), which
-    all require [Ord], see `set_order()`. With it, methods that only require
-    [PartialEq] (e.g. `contains()`) can binary search data in a known order,
-    see `ordering()`: [Ord] must agree with [PartialEq], so the results are
-    the same as those of a linear scan.
+    The comparison of a known order (ASC or DESC): `T::cmp`, kept by the
+    methods that set a known order, which all require [Ord], or for floats
+    `float_order()`, kept by `sort_fp()`, see `set_order()`. With it, methods
+    that only require [PartialEq] (e.g. `contains()`) can binary search data
+    in a known order, see `ordering()`. Values that are `==` compare equal,
+    and the other way around, so the results are the same as those of a
+    linear scan. The exception is a float NaN, which is not equal to itself:
+    `==` finds it nowhere, so lookups skip the search, see `equals_itself()`.
 
     NOTE: this is a workaround for specialization, which stable Rust does not
     have yet (rust-lang/rust#31844). Revisit when it is stable: those methods
@@ -420,7 +423,18 @@ impl<T> EnhVecInner<T> {
     }
 
     /**
-    How `a` compares to `b` in the known order: `T::cmp`, reversed for DESC.
+    Set a known order (ASC or DESC) of data sorted by `cmp`, which is kept for
+    the methods without an [Ord] bound, see `cmp`. Every known order is set
+    here.
+    */
+    fn set_order(&mut self, state: SortState, cmp: fn(&T, &T) -> Ordering) {
+        debug_assert!(state.is_sorted());
+        self.cmp = Some(cmp);
+        self.state = state;
+    }
+
+    /**
+    How `a` compares to `b` in the known order: `cmp`, reversed for DESC.
     `None` if the order is not known. Lets methods without an [Ord] bound
     binary search, see `cmp`.
     */
@@ -430,7 +444,7 @@ impl<T> EnhVecInner<T> {
             SortState::Desc => true,
             _ => return None,
         };
-        debug_assert!(self.cmp.is_some(), "a known order without T::cmp");
+        debug_assert!(self.cmp.is_some(), "a known order without its comparison");
         let cmp: fn(&T, &T) -> Ordering = self.cmp?;
         Some(move |a: &T, b: &T| if desc { cmp(b, a) } else { cmp(a, b) })
     }
@@ -608,15 +622,19 @@ impl<T: PartialOrd> EnhVecInner<T> {
     /**
     Whether neighbors `a` and `b` break the known sort order. For unsorted
     data any addition counts as a change, and once changed, nothing does.
+    Values that [PartialOrd] cannot compare (a float NaN) are placed by the
+    comparison of the known order, see `cmp`.
     */
     #[inline]
     fn out_of_order(&self, a: &T, b: &T) -> bool {
-        match self.state {
-            SortState::Unsorted => true,
-            SortState::Changed => false,
-            SortState::Asc => a > b,
-            SortState::Desc => a < b,
-        }
+        let wrong_way: Ordering = match self.state {
+            SortState::Unsorted => return true,
+            SortState::Changed => return false,
+            SortState::Asc => Ordering::Greater,
+            SortState::Desc => Ordering::Less,
+        };
+        let order: Option<Ordering> = a.partial_cmp(b).or_else(|| Some(self.cmp?(a, b)));
+        order.is_none_or(|order: Ordering| order == wrong_way)
     }
 }
 
@@ -624,18 +642,10 @@ impl<T: Ord> EnhVecInner<T> {
     fn sort(&mut self, sorting: &Sorting, stable: bool) {
         sort_vec(self.buf.as_mut_slice(), &self.state, sorting, stable);
         match sorting {
-            Sorting::Ascending => self.set_order(SortState::Asc),
-            Sorting::Descending => self.set_order(SortState::Desc),
+            Sorting::Ascending => self.set_order(SortState::Asc, T::cmp),
+            Sorting::Descending => self.set_order(SortState::Desc, T::cmp),
             _ => self.state = SortState::Unsorted,
         }
-    }
-
-    /// Set a known order (ASC or DESC), and keep `T::cmp` for the methods
-    /// without an [Ord] bound, see `cmp`. Every known order is set here.
-    fn set_order(&mut self, state: SortState) {
-        debug_assert!(state.is_sorted());
-        self.cmp = Some(T::cmp);
-        self.state = state;
     }
 
     /**
@@ -665,6 +675,19 @@ impl<T: Ord> EnhVecInner<T> {
 }
 
 /* --------------------------------- */
+
+impl<T: Float> EnhVecInner<T> {
+    fn sort_fp(&mut self, sorting: &Sorting) {
+        // equal elements are the same for total_cmp(), so unstable is fine
+        let elements: &mut [T] = self.buf.as_mut_slice();
+        sort_vec_by(elements, &self.state, sorting, false, T::total_cmp);
+        match sorting {
+            Sorting::Ascending => self.set_order(SortState::Asc, float_order::<T>),
+            Sorting::Descending => self.set_order(SortState::Desc, float_order::<T>),
+            _ => self.state = SortState::Unsorted,
+        }
+    }
+}
 
 impl<T: PartialEq> PartialEq for EnhVecInner<T> {
     fn eq(&self, other: &Self) -> bool {
@@ -989,7 +1012,7 @@ impl<T: Ord> EnhVec<T> {
                     return;
                 }
             };
-            self.data.set_order(state);
+            self.data.set_order(state, T::cmp);
         }
         self.data.insert_sorted(element);
     }
@@ -1080,6 +1103,9 @@ impl<T: PartialEq> EnhVec<T> {
         let Some(ord) = self.data.ordering() else {
             return self.data.internal_iter().filter(|&x| x == value).count();
         };
+        if !equals_itself(value) {
+            return 0;
+        }
         // the equal elements are next to each other
         let elements: &[T] = self.as_slice();
         let start: usize = elements.partition_point(|x: &T| ord(x, value) == Ordering::Less);
@@ -1093,6 +1119,9 @@ impl<T: PartialEq> EnhVec<T> {
         let Some(ord) = self.data.ordering() else {
             return self.data.internal_iter().any(|x: &T| x == value);
         };
+        if !equals_itself(value) {
+            return false;
+        }
         let found: Result<usize, usize> = self.as_slice().binary_search_by(|x: &T| ord(x, value));
         found.is_ok()
     }
@@ -1699,7 +1728,7 @@ impl<T: Copy + Eq + Hash> EnhVec<T> {
         let mut result: EnhVec<T> = EnhVec::new_from(unique);
         if known_order {
             // dropping duplicates keeps a known order
-            result.data.set_order(self.data.state.clone());
+            result.data.set_order(self.data.state.clone(), T::cmp);
         }
         if let Some(sorting) = sorted {
             // the elements are unique, so this is the same as a stable sort
@@ -1711,6 +1740,30 @@ impl<T: Copy + Eq + Hash> EnhVec<T> {
 }
 
 /* --------------------------------- */
+
+impl<T: Copy> EnhVec<T> {
+    /**
+    The element at position `idx` of the data in ASCending order by `cmp`,
+    and if `with_next`, the one after it. Time complexity: `O(1)` if the order
+    is known (which is then that of `cmp`), else `O(N)` (selection on a copy
+    of the data, not a full sort).
+    */
+    fn select_asc<F>(&self, idx: usize, with_next: bool, cmp: F) -> (T, Option<T>)
+    where
+        F: FnMut(&T, &T) -> Ordering,
+    {
+        if !self.data.state.is_sorted() {
+            return select_by(&mut self.to_vec(), idx, with_next, cmp);
+        }
+        let len: usize = self.len();
+        let at_asc = |i: usize| match self.data.state {
+            SortState::Desc => self.data[len - 1 - i],
+            _ => self.data[i],
+        };
+        let next: Option<T> = (with_next && idx + 1 < len).then(|| at_asc(idx + 1));
+        (at_asc(idx), next)
+    }
+}
 
 impl<T: Integer> EnhVec<T> {
     /**
@@ -1732,24 +1785,6 @@ impl<T: Integer> EnhVec<T> {
         max.checked_sub(min)
     }
 
-    /**
-    The element at position `idx` of the data in ASCending order, and if
-    `with_next`, the one after it. Time complexity: `O(1)` if the order is
-    known, else `O(N)` (selection on a copy of the data, not a full sort).
-    */
-    fn select_asc(&self, idx: usize, with_next: bool) -> (T, Option<T>) {
-        if !self.data.state.is_sorted() {
-            return select_by(&mut self.to_vec(), idx, with_next, T::cmp);
-        }
-        let len: usize = self.len();
-        let at_asc = |i: usize| match self.data.state {
-            SortState::Desc => self.data[len - 1 - i],
-            _ => self.data[i],
-        };
-        let next: Option<T> = (with_next && idx + 1 < len).then(|| at_asc(idx + 1));
-        (at_asc(idx), next)
-    }
-
     /// Return the median (aka. the middle) value of the elements.
     /// Time complexity: `O(1)` if the order is known, else `O(N)`.
     pub fn median(&self) -> Option<T> {
@@ -1761,10 +1796,10 @@ impl<T: Integer> EnhVec<T> {
 
         if self.len().is_multiple_of(2) {
             // unlike `(a + b) / 2`, midpoint() cannot overflow
-            let (below, above): (T, Option<T>) = self.select_asc(mid - 1, true);
+            let (below, above): (T, Option<T>) = self.select_asc(mid - 1, true, T::cmp);
             above.map(|above: T| T::midpoint(below, above))
         } else {
-            Some(self.select_asc(mid, false).0)
+            Some(self.select_asc(mid, false, T::cmp).0)
         }
     }
 
@@ -1824,29 +1859,49 @@ impl<T: Integer> EnhVec<T> {
         }
 
         let index: usize = (p * (self.len() - 1) as f64).round() as usize;
-        Some(self.select_asc(index, false).0)
+        Some(self.select_asc(index, false, T::cmp).0)
     }
 }
 
 /* --------------------------------- */
 
 impl<T: Float> EnhVec<T> {
-    /// Return the median (aka. the middle) value of the elements.
-    /// Floating point compatible version. NaNs are ordered by `total_cmp()`.
+    /**
+    Sort the elements by `total_cmp()`, the float version of `sort()`: from
+    -NaN, -inf and the negative numbers to -0.0 and +0.0, and the positive
+    numbers, inf and NaN. This makes the order known, like after `sort()`:
+    `median_fp()` and `percentile_fp()` are then `O(1)`, and `contains()` and
+    `count()` binary search. Like `==`, those find both -0.0 and +0.0 for
+    either one, and no NaN.
+
+    The elements that are equal for `total_cmp()` are the same, so this is an
+    unstable sort. Pushes and inserts keep the order known if the new element
+    is in order. -0.0 and +0.0 count as equal there, so they can then end up
+    in either order.
+    */
+    pub fn sort_fp(&mut self, sorting: Sorting) {
+        self.data.sort_fp(&sorting);
+        self.sort = sorting;
+    }
+
+    /**
+    Return the median (aka. the middle) value of the elements.
+    Floating point compatible version. NaNs are ordered by `total_cmp()`.
+    Time complexity: `O(1)` if the order is known (see `sort_fp()`), else `O(N)`.
+    */
     pub fn median_fp(&self) -> Option<T> {
         if self.is_empty() {
             return None;
         }
 
-        let mut data: Vec<T> = self.to_vec();
-        let mid: usize = data.len() / 2;
+        let mid: usize = self.len() / 2;
 
-        if data.len().is_multiple_of(2) {
+        if self.len().is_multiple_of(2) {
             // unlike `(a + b) / 2`, midpoint() cannot overflow to infinity
-            let (below, above): (T, Option<T>) = select_by(&mut data, mid - 1, true, T::total_cmp);
+            let (below, above): (T, Option<T>) = self.select_asc(mid - 1, true, T::total_cmp);
             above.map(|above: T| T::midpoint(below, above))
         } else {
-            Some(select_by(&mut data, mid, false, T::total_cmp).0)
+            Some(self.select_asc(mid, false, T::total_cmp).0)
         }
     }
 
@@ -1889,7 +1944,8 @@ impl<T: Float> EnhVec<T> {
     }
 
     /// Return the percentile value of the elements. Floating point version.
-    /// NOTE: `0.0 <= p <= 1.0`. NaNs are ordered by `total_cmp()`.
+    /// NOTE: `0.0 <= p <= 1.0`. NaNs are ordered by `total_cmp()`. Time
+    /// complexity: `O(1)` if the order is known (see `sort_fp()`), else `O(N)`.
     pub fn percentile_fp(&self, p: f64) -> Option<T> {
         // written as !contains() so that a NaN `p` is rejected as well
         if self.is_empty() || !(0.0..=1.0).contains(&p) {
@@ -1897,7 +1953,7 @@ impl<T: Float> EnhVec<T> {
         }
 
         let index: usize = (p * (self.len() - 1) as f64).round() as usize;
-        Some(select_by(&mut self.to_vec(), index, false, T::total_cmp).0)
+        Some(self.select_asc(index, false, T::total_cmp).0)
     }
 }
 
@@ -2055,6 +2111,30 @@ impl_float!(f32, f64);
 
 /* ########################### Utility functions ########################### */
 
+/**
+The known order of floats (see `sort_fp()`): `total_cmp()`, but with -0.0
+and +0.0 equal, as they are for `==`. Otherwise values are only equal for
+`total_cmp()` if they are the same, so this agrees with `==`, except that
+a NaN is not `==` to itself, see `equals_itself()`.
+*/
+fn float_order<T: Float>(a: &T, b: &T) -> Ordering {
+    let zero: T = T::zero();
+    match *a == zero && *b == zero {
+        true => Ordering::Equal,
+        false => a.total_cmp(b),
+    }
+}
+
+/**
+Whether `x == x`. Of the types that can have a known order, only a float NaN
+is not equal to itself, and then `==` finds it nowhere, so lookups need not
+search for it (the comparison of the known order would find it).
+*/
+#[allow(clippy::eq_op)]
+fn equals_itself<T: PartialEq>(x: &T) -> bool {
+    x == x
+}
+
 /// The index of the first element of `v` for which `pred` is false, `v` being
 /// partitioned by it. Linear search for small slices, binary for larger ones.
 fn partition_idx<T>(v: &[T], mut pred: impl FnMut(&T) -> bool) -> usize {
@@ -2132,6 +2212,14 @@ fn fold_digests(digests: impl Iterator<Item = u64>) -> (u64, u64) {
 /// Sort a vector in place, based on the current and desired sorting state.
 /// Unless `stable`, equal elements may be reordered.
 fn sort_vec<T: Ord>(v: &mut [T], state: &SortState, desired: &Sorting, stable: bool) {
+    sort_vec_by(v, state, desired, stable, T::cmp);
+}
+
+/// Like `sort_vec()`, with `cmp` as the ascending order.
+fn sort_vec_by<T, F>(v: &mut [T], state: &SortState, desired: &Sorting, stable: bool, cmp: F)
+where
+    F: Fn(&T, &T) -> Ordering,
+{
     // short circuit no-ops
     let noop: bool = matches!(
         (state, desired),
@@ -2145,10 +2233,10 @@ fn sort_vec<T: Ord>(v: &mut [T], state: &SortState, desired: &Sorting, stable: b
 
     if state.is_unsorted() {
         match (desired, stable) {
-            (Sorting::Ascending, true) => v.sort(),
-            (Sorting::Ascending, false) => v.sort_unstable(),
-            (_, true) => v.sort_by(|a, b| b.cmp(a)),
-            (_, false) => v.sort_unstable_by(|a, b| b.cmp(a)),
+            (Sorting::Ascending, true) => v.sort_by(cmp),
+            (Sorting::Ascending, false) => v.sort_unstable_by(cmp),
+            (_, true) => v.sort_by(|a: &T, b: &T| cmp(b, a)),
+            (_, false) => v.sort_unstable_by(|a: &T, b: &T| cmp(b, a)),
         }
     } else {
         // we already know the vec is sorted, but not in the desired order
@@ -3102,6 +3190,87 @@ mod tests {
                 assert!(unique.data.ordering().is_some(), "distinct() keeps the known order");
             }
         }
+    }
+
+    /// Bit patterns, to compare floats including NaNs and the sign of zero.
+    fn bits(values: &[f64]) -> Vec<u64> {
+        values.iter().map(|x: &f64| x.to_bits()).collect()
+    }
+
+    /// Floats with the special values, zeros of both signs and duplicates.
+    #[rustfmt::skip]
+    const FLOATS: [f64; 12] = [
+        3.5, -0.0, f64::NAN, 0.0, -f64::NAN, f64::INFINITY, -1.0, 3.5, f64::NEG_INFINITY, 0.0, -2.5, 1e-310,
+    ];
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_sort_fp() {
+        let mut expected: Vec<f64> = FLOATS.to_vec();
+        expected.sort_by(f64::total_cmp);
+        let mut ev: EnhVec<f64> = EnhVec::from_iter(FLOATS);
+        ev.sort_fp(Sorting::Ascending);
+        assert_eq!(bits(&ev), bits(&expected), "ASC by total_cmp()");
+        assert!(ev.data.ordering().is_some() && ev.is_sorted(), "known order");
+
+        ev.sort_fp(Sorting::Descending);
+        expected.reverse();
+        assert_eq!(bits(&ev), bits(&expected), "DESC");
+        ev.sort_fp(Sorting::None);
+        assert!(ev.data.ordering().is_none(), "no known order");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_known_float_order() {
+        let unknown: EnhVec<f64> = EnhVec::from_iter(FLOATS);
+        let probes: [f64; 11] = [
+            0.0, -0.0, f64::NAN, -f64::NAN, 3.5, 4.0, f64::INFINITY, f64::NEG_INFINITY, 1e-310, -2.5, -7.0,
+        ];
+        for sorting in [Sorting::Ascending, Sorting::Descending] {
+            let mut ev: EnhVec<f64> = unknown.clone();
+            ev.sort_fp(sorting);
+            // the same as linear scans with `==`, and selections by total_cmp()
+            for x in probes {
+                assert_eq!(ev.count(&x), unknown.count(&x), "count({x}), {sorting:?}");
+                assert_eq!(ev.contains(&x), unknown.contains(&x), "contains({x}), {sorting:?}");
+            }
+            let median = |ev: &EnhVec<f64>| ev.median_fp().map(f64::to_bits);
+            assert_eq!(median(&ev), median(&unknown), "median_fp(), {sorting:?}");
+            for p in [0.0, 0.1, 0.5, 0.9, 1.0] {
+                let percentile = |ev: &EnhVec<f64>| ev.percentile_fp(p).map(f64::to_bits);
+                assert_eq!(percentile(&ev), percentile(&unknown), "percentile_fp({p}), {sorting:?}");
+            }
+            let mut odd: EnhVec<f64> = unknown.clone();
+            odd.pop();
+            let odd_median: Option<u64> = median(&odd);
+            odd.sort_fp(sorting);
+            assert_eq!(median(&odd), odd_median, "odd median_fp(), {sorting:?}");
+        }
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_known_float_order_pushes() {
+        // NaNs are placed by total_cmp(), which PartialOrd cannot do
+        let mut ev: EnhVec<f64> = EnhVec::from_iter([1.0, 2.0]);
+        ev.sort_fp(Sorting::Ascending);
+        ev.push(f64::NAN);
+        ev.push_front(-f64::NAN);
+        assert!(ev.data.ordering().is_some(), "NaN last and -NaN first in ASC");
+        ev.push(0.0);
+        assert!(ev.data.ordering().is_none(), "0.0 after NaN in ASC");
+
+        // -0.0 and +0.0 are equal in the known order
+        let mut ev: EnhVec<f64> = EnhVec::from_iter([1.0, 0.0]);
+        ev.sort_fp(Sorting::Descending);
+        ev.push(-0.0);
+        ev.push(0.0);
+        assert!(ev.data.ordering().is_some(), "zeros in either order");
+        assert_eq!((ev.count(&0.0), ev.count(&-0.0)), (3, 3), "all zeros found");
+        ev.insert(1, f64::NAN);
+        assert!(ev.data.ordering().is_none(), "NaN after 1.0 in DESC");
+        assert_eq!((ev.count(&0.0), ev.count(&f64::NAN)), (3, 0), "linear lookups");
     }
 
     #[test]

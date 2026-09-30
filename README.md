@@ -70,7 +70,7 @@ let unique = vec.distinct(Some(Sorting::Ascending));
 - `push()`, `push_front()`, `push_swap_front()`, `insert()`, `insert_sorted()`
 - `pop()`, `pop_front()`, `swap_pop_front()`
 - `extend()` (the `Extend` trait, also from `&T` for `Copy` types), `extend_sorted()`, `append()`
-- `reverse()`, `sort()`, `sort_by()`, `sort_unstable()`, `sort_unstable_by()`, `is_sorted()`, `as_sorted_asc()`, `as_sorted_desc()`
+- `reverse()`, `sort()`, `sort_by()`, `sort_unstable()`, `sort_unstable_by()`, `sort_fp()`, `is_sorted()`, `as_sorted_asc()`, `as_sorted_desc()`
 - `get()`, `get_mut()`, indexing, `first()`, `last()`, `to_vec()`, `into_vec()`
 - `as_slice()`, `as_mut_slice()`, `Deref`/`DerefMut` to `[T]`, `AsRef<[T]>`/`AsMut<[T]>`, indexing with ranges (`ev[1..3]`), `binary_search()`
 - `iter()`, `iter_mut()` (double-ended, e.g. `iter().rev()`), `IntoIterator` for `EnhVec` and its references
@@ -86,8 +86,8 @@ The elements are always one slice, in order, so all slice methods work on an `En
 (`as_mut_slice()`, mutable slice methods or indexing) resets the known sort order.
 `binary_search()` follows the known order, so it also works on data sorted in descending order.
 
-With a known order (after `sort()`, or found by `insert_sorted()`), `contains()`, `count()` and
-`binary_search()` are `O(log N)`, and `mode()`, `distinct()` and `set_relation_sorted()` work
+With a known order (after `sort()` or, for floats, `sort_fp()`, or found by `insert_sorted()`),
+`contains()`, `count()` and `binary_search()` are `O(log N)`, and `mode()`, `distinct()` and `set_relation_sorted()` work
 on the elements in place, without hashing or sorting: ~600x faster lookups in 1M elements, and
 3-18x for the rest.
 
@@ -129,7 +129,10 @@ if rel.is_proper_subset() || rel.is_partial_overlap() { /* ... */ }
 `variance()` is the population variance (divided by `N`), for integers and floats alike.
 `product()` multiplies as `i128` and returns `None` on overflow, and `range()` returns `None` if
 the range does not fit in the element type. The floating point versions order NaNs with
-`total_cmp()`. `mode()` breaks ties by first appearance, and `distinct()` keeps the order of first
+`total_cmp()`. `sort_fp()` sorts floats by `total_cmp()` and makes their order known, so that
+`median_fp()` and `percentile_fp()` are then `O(1)` (e.g. 3 ms to 40 ns for 1M elements), and
+`contains()` and `count()` binary search. Like `==`, those find both -0.0 and +0.0 for either one,
+and no NaN. `mode()` breaks ties by first appearance, and `distinct()` keeps the order of first
 appearance unless asked to sort, so both are deterministic.
 
 ### Hashing
@@ -189,9 +192,10 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
-- Unreleased: Slice API, faster lookups in a known order
+- Unreleased: Slice API, faster lookups in a known order, `sort_fp()`
     - `Deref`/`DerefMut` to `[T]`, `AsMut<[T]>`, indexing with ranges, `binary_search()` in the known order
     - With a known order: `contains()`, `count()` and the set operations binary search, and `mode()`, `distinct()` and `set_relation_sorted()` need no hashing or sorting
+    - `sort_fp()` gives floats a known order: `O(1)` `median_fp()` and `percentile_fp()`, and binary searching `contains()` and `count()`
 - 0.6.0: One buffer for all elements, with free space at both ends
     - The elements are always one slice: indexing and iteration run at `Vec` speed, `From<Vec<T>>` and `into_vec()` reuse the buffer
     - Pushes as fast as `Vec::push()`, `O(1)` pops at both ends without moving elements (2-7x faster), faster queues; sorted inserts ~20% slower, as one buffer shifts more elements than two
