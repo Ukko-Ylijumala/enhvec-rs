@@ -97,8 +97,10 @@ superset, disjoint or partial overlap.
 - Unique values: `distinct()`
 
 `variance()` is the population variance (divided by `N`), for integers and floats alike.
-`product()` multiplies as `i128` and returns `None` on overflow. The floating point versions
-order NaNs with `total_cmp()`.
+`product()` multiplies as `i128` and returns `None` on overflow, and `range()` returns `None` if
+the range does not fit in the element type. The floating point versions order NaNs with
+`total_cmp()`. `mode()` breaks ties by first appearance, and `distinct()` keeps the order of first
+appearance unless asked to sort, so both are deterministic.
 
 ### Hashing
 
@@ -125,6 +127,10 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
+- Unreleased
+    - `Default` no longer requires `T: Default`, `sort_by()` no longer requires `Ord` (e.g. `sort_by(f64::total_cmp)`)
+    - Deterministic `mode()` ties and `distinct()` order, no overflow in `average_fp()`
+    - Breaking: `range()` is for `Integer` types and returns `None` if the range does not fit, `Integer`/`Float` have new required methods
 - 0.5.0: Correctness and performance pass
     - Fix element order corruption in `compact()`, `insert()`, `reverse()`, `pop_front()` and `insert_sorted()`, and a panic in `insert_sorted()`
     - Fix `sort()`/`extend_sorted()` skipping the sort after mutations, and `iter_mut()` leaving a stale sort state

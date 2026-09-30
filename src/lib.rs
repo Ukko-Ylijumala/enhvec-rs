@@ -63,7 +63,7 @@ impl SortState {
 /* --------------------------------- */
 
 /// The actual internal representation of the [EnhVec].
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct EnhVecInner<T> {
     state: SortState,
     head: Vec<T>,
@@ -71,6 +71,15 @@ struct EnhVecInner<T> {
 }
 
 impl<T> EnhVecInner<T> {
+    fn sort_by<F>(&mut self, f: F)
+    where
+        F: FnMut(&T, &T) -> Ordering,
+    {
+        self.set_changed(); // cannot know what `f` does to the order
+        self.compact();
+        self.main.sort_by(f);
+    }
+
     fn new() -> Self {
         Self {
             state: SortState::Unsorted,
@@ -401,15 +410,6 @@ impl<T: Ord> EnhVecInner<T> {
         };
     }
 
-    fn sort_by<F>(&mut self, f: F)
-    where
-        F: FnMut(&T, &T) -> Ordering,
-    {
-        self.set_changed(); // cannot know what `f` does to the order
-        self.compact();
-        self.main.sort_by(f);
-    }
-
     /**
     Insert an element into its sorted position. The data must be known to
     be sorted (state ASC or DESC), and the element is inserted in that order,
@@ -485,22 +485,26 @@ This struct provides additional methods for handling elements:
 - pushing elements to the front of the vector
 - hashing the elements in a stable, repeatable way
 */
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct EnhVec<T> {
     data: EnhVecInner<T>,
     sort: Sorting,
 }
 
-// Technically PartialEq and PartialOrd bounds are not needed for the
-// methods in this block, but we want to restrict the types allowed
-// in EnhVec to those that can be compared and sorted.
-impl<T: PartialEq + PartialOrd> EnhVec<T> {
+// Implemented by hand, as #[derive(Default)] would require `T: Default`
+impl<T> Default for EnhVec<T> {
     fn default() -> Self {
         Self {
             data: EnhVecInner::new(),
             sort: Sorting::None,
         }
     }
+}
+
+// Technically PartialEq and PartialOrd bounds are not needed for the
+// methods in this block, but we want to restrict the types allowed
+// in EnhVec to those that can be compared and sorted.
+impl<T: PartialEq + PartialOrd> EnhVec<T> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -557,6 +561,19 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
 
 // Generic methods for all types
 impl<T> EnhVec<T> {
+    /**
+    Use a comparison Fn to sort the elements. Passthrough to Vec::sort_by().
+    Clears the default [Sorting], as the resulting order is custom. Needs no
+    [Ord], so also works for floats, e.g. with `sort_by(f64::total_cmp)`.
+    */
+    pub fn sort_by<F>(&mut self, f: F)
+    where
+        F: FnMut(&T, &T) -> Ordering,
+    {
+        self.data.sort_by(f);
+        self.sort = Sorting::None;
+    }
+
     /// Reverse the order of the elements in place. [Sorting] is updated.
     pub fn reverse(&mut self) {
         self.data.reverse();
@@ -753,16 +770,6 @@ impl<T: Ord> EnhVec<T> {
     pub fn sort(&mut self, sorting: Sorting) {
         self.data.sort(&sorting);
         self.sort = sorting;
-    }
-
-    /// Use a comparison Fn to sort the elements. Passthrough to Vec::sort_by().
-    /// Clears the default [Sorting], as the resulting order is custom.
-    pub fn sort_by<F>(&mut self, f: F)
-    where
-        F: FnMut(&T, &T) -> Ordering,
-    {
-        self.data.sort_by(f);
-        self.sort = Sorting::None;
     }
 
     /// Extend this [EnhVec] from an iterator. If a default [Sorting] is set
@@ -1101,56 +1108,43 @@ impl<T: Copy + Sum> EnhVec<T> {
     }
 }
 
-impl<T> EnhVec<T>
-where
-    T: Copy + Ord + Sub<Output = T>,
-{
-    /// Return the range (max - min) of the elements.
-    /// Time complexity: `O(1)` if the order is known, else `O(N)`.
-    pub fn range(&self) -> Option<T> {
-        let (first, last): (T, T) = (*self.first()?, *self.last()?);
-        match self.data.state {
-            SortState::Asc => Some(last - first),
-            SortState::Desc => Some(first - last),
-            _ => {
-                // min and max in a single pass
-                let (min, max): (T, T) = self
-                    .data
-                    .internal_iter()
-                    .fold((first, first), |(min, max), &x| (min.min(x), max.max(x)));
-                Some(max - min)
-            }
-        }
-    }
-}
-
 /* --------------------------------- */
 
 impl<T: Copy + Eq + Hash> EnhVec<T> {
-    /// Return the mode (most common) value of the elements.
+    /// Return the mode (most common) value of the elements. If several values
+    /// are equally common, the one that appears first is returned.
     pub fn mode(&self) -> Option<T> {
-        if self.is_empty() {
-            return None;
-        }
-
-        let mut counts: HashMap<T, u32> = HashMap::new();
+        let mut counts: HashMap<T, usize> = HashMap::new();
         for &item in self.data.internal_iter() {
             *counts.entry(item).or_insert(0) += 1;
         }
 
-        counts
-            .into_iter()
-            .max_by_key(|&(_, count)| count)
-            .map(|(item, _)| item)
+        // pick by the element order, so the result does not depend on the HashMap's
+        let max: usize = counts.values().copied().max()?;
+        self.data
+            .internal_iter()
+            .copied()
+            .find(|item: &T| counts[item] == max)
     }
 
-    /// Return the distinct (unique) elements, optionally sorted.
+    /// Return the distinct (unique) elements in the order of their first
+    /// appearance, or sorted if requested.
     pub fn distinct(&self, sorted: Option<Sorting>) -> EnhVec<T>
     where
         T: Copy + Eq + Hash + Ord,
     {
-        let set: HashSet<T> = self.data.internal_iter().copied().collect();
-        let mut result: EnhVec<T> = EnhVec::from_iter(set);
+        let mut seen: HashSet<T> = HashSet::new();
+        let unique: Vec<T> = self
+            .data
+            .internal_iter()
+            .copied()
+            .filter(|&x| seen.insert(x))
+            .collect();
+        let mut result: EnhVec<T> = EnhVec::new_from(unique);
+        if self.data.state.is_sorted() {
+            // dropping duplicates keeps a known order
+            result.data.state = self.data.state.clone();
+        }
         if let Some(sorting) = sorted {
             result.sort(sorting);
         }
@@ -1161,6 +1155,25 @@ impl<T: Copy + Eq + Hash> EnhVec<T> {
 /* --------------------------------- */
 
 impl<T: Integer> EnhVec<T> {
+    /**
+    Return the range (max - min) of the elements. `None` if there are none,
+    or if the range does not fit in `T` (e.g. `i8` values -128 and 127).
+    Time complexity: `O(1)` if the order is known, else `O(N)`.
+    */
+    pub fn range(&self) -> Option<T> {
+        let (first, last): (T, T) = (*self.first()?, *self.last()?);
+        let (min, max): (T, T) = match self.data.state {
+            SortState::Asc => (first, last),
+            SortState::Desc => (last, first),
+            // min and max in a single pass
+            _ => self
+                .data
+                .internal_iter()
+                .fold((first, first), |(min, max), &x| (min.min(x), max.max(x))),
+        };
+        max.checked_sub(min)
+    }
+
     /**
     The element at position `idx` of the data in ASCending order, and if
     `with_next`, the one after it. Time complexity: `O(1)` if the order is
@@ -1291,8 +1304,13 @@ impl<T: Float> EnhVec<T> {
             return None;
         }
 
+        let len: T = T::from_usize(self.len()).unwrap();
         let sum: T = self.data.internal_iter().copied().sum();
-        Some(sum / T::from_usize(self.len()).unwrap())
+        if sum.is_finite() {
+            return Some(sum / len);
+        }
+        // the sum overflowed (or there are infinities/NaNs): sum pre-divided values
+        Some(self.data.internal_iter().map(|&x: &T| x / len).sum())
     }
 
     /// Return the product of all elements. Floating point version.
@@ -1356,6 +1374,8 @@ pub trait Integer:
     fn from_usize(n: usize) -> Option<Self>;
     /// `(self + rhs) / 2` without overflow, rounded towards zero.
     fn midpoint(self, rhs: Self) -> Self;
+    /// `self - rhs`, or `None` on overflow.
+    fn checked_sub(self, rhs: Self) -> Option<Self>;
 }
 
 /// Common code for "small" integer types.
@@ -1371,6 +1391,8 @@ macro_rules! impl_integer {
                 fn from_usize(n: usize) -> Option<Self> { n.try_into().ok() }
                 #[inline]
                 fn midpoint(self, rhs: Self) -> Self { self.midpoint(rhs) }
+                #[inline]
+                fn checked_sub(self, rhs: Self) -> Option<Self> { self.checked_sub(rhs) }
             }
         )*
     }
@@ -1389,6 +1411,8 @@ macro_rules! impl_big_integer {
                 fn from_usize(n: usize) -> Option<Self> { Some(n as Self) }
                 #[inline]
                 fn midpoint(self, rhs: Self) -> Self { self.midpoint(rhs) }
+                #[inline]
+                fn checked_sub(self, rhs: Self) -> Option<Self> { self.checked_sub(rhs) }
             }
         )*
     }
@@ -1449,6 +1473,8 @@ pub trait Float:
     fn midpoint(self, rhs: Self) -> Self;
     /// Total ordering, including NaN (see [f64::total_cmp]).
     fn total_cmp(&self, other: &Self) -> Ordering;
+    /// Neither infinite nor NaN.
+    fn is_finite(self) -> bool;
 }
 
 /// Common code for floating point types.
@@ -1470,6 +1496,8 @@ macro_rules! impl_float {
                 fn midpoint(self, rhs: Self) -> Self { self.midpoint(rhs) }
                 #[inline]
                 fn total_cmp(&self, other: &Self) -> Ordering { self.total_cmp(other) }
+                #[inline]
+                fn is_finite(self) -> bool { self.is_finite() }
             }
         )*
     }
@@ -2179,6 +2207,71 @@ mod tests {
             assert!(desc.data.state == SortState::Desc && !desc.data.head.is_empty());
             check_order_stats(&desc, &[data, &[XTRA]].concat(), "DESC with head");
         }
+    }
+
+    #[test]
+    fn test_default_without_default_elements() {
+        // Ordering has no Default impl, which #[derive(Default)] used to require
+        #[derive(Default)]
+        struct Holder {
+            ev: EnhVec<Ordering>,
+        }
+        let holder: Holder = Holder::default();
+        assert!(holder.ev.is_empty());
+    }
+
+    #[test]
+    fn test_sort_by_floats() {
+        let mut ev: EnhVec<f64> = EnhVec::from_iter([3.0, f64::NAN, -1.0, 2.0]);
+        ev.sort_by(f64::total_cmp);
+        let sorted: Vec<f64> = ev.to_vec();
+        assert_eq!(sorted[..3], [-1.0, 2.0, 3.0]);
+        assert!(sorted[3].is_nan());
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_mode_and_distinct_deterministic() {
+        // equally common values: the first one to appear wins
+        let ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        assert_eq!(ev.mode(), Some(3), "mode");
+        let mut tie: EnhVec<u32> = EnhVec::from_iter([1, 2, 1, 2]);
+        assert_eq!(tie.mode(), Some(1), "mode");
+        tie.reverse();
+        assert_eq!(tie.mode(), Some(2), "mode, reversed");
+
+        let distinct: EnhVec<u32> = ev.distinct(None);
+        assert_eq!(distinct.to_vec(), vec![3, 1, 4, 5, 9, 2, 6, 8, 7], "first appearance order");
+        let mut asc: EnhVec<u32> = ev.clone();
+        asc.sort(Sorting::Ascending);
+        let distinct: EnhVec<u32> = asc.distinct(None);
+        assert_eq!(distinct.to_vec(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9], "sorted source");
+        assert_eq!(distinct.data.state, SortState::Asc, "known order kept");
+    }
+
+    #[test]
+    fn test_range_overflow() {
+        let ev: EnhVec<i8> = EnhVec::from_iter([-128, 127]);
+        assert_eq!(ev.range(), None, "range does not fit in i8");
+        let ev: EnhVec<i8> = EnhVec::from_iter([-100, 27, 5]);
+        assert_eq!(ev.range(), Some(127), "range fits in i8");
+        let mut ev: EnhVec<u8> = EnhVec::from_iter([0, 255, 7]);
+        assert_eq!(ev.range(), Some(255), "unknown order");
+        ev.sort(Sorting::Descending);
+        assert_eq!(ev.range(), Some(255), "DESC");
+    }
+
+    #[test]
+    fn test_average_fp_overflow() {
+        let ev: EnhVec<f64> = EnhVec::from_iter([f64::MAX, f64::MAX]);
+        assert_eq!(ev.average_fp(), Some(f64::MAX), "sum overflows");
+        let ev: EnhVec<f64> = EnhVec::from_iter([1e308, 1e308, 1e308]);
+        let diff: f64 = ev.average_fp().unwrap() / 1e308 - 1.0;
+        assert!(diff.abs() < EPSILON, "sum overflows, relative diff {diff}");
+        let ev: EnhVec<f64> = EnhVec::from_iter([1.0, f64::INFINITY]);
+        assert_eq!(ev.average_fp(), Some(f64::INFINITY), "infinite element");
+        let ev: EnhVec<f64> = EnhVec::from_iter([1.0, f64::NAN]);
+        assert!(ev.average_fp().is_some_and(f64::is_nan), "NaN element");
     }
 
     #[test]
