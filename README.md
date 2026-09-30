@@ -178,7 +178,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
-- Unreleased: One buffer for all elements, with free space at both ends
+- 0.6.0: One buffer for all elements, with free space at both ends
     - The elements are always one slice: indexing and iteration run at `Vec` speed, `From<Vec<T>>` and `into_vec()` reuse the buffer
     - Pushes as fast as `Vec::push()`, `O(1)` pops at both ends without moving elements (2-7x faster), faster queues; sorted inserts ~20% slower, as one buffer shifts more elements than two
     - `swap_pop_front()` is the same as `pop_front()`, `push_swap_front()` moves the first element to the back when there is no free space at the front
