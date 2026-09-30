@@ -110,12 +110,10 @@ impl<T> EnhVecInner<T> {
         self.main.last().or_else(|| self.head.first())
     }
 
-    /// Set the internal sorting state to "changed" if it isn't already.
+    /// Set the internal sorting state to "changed".
     #[inline]
     fn set_changed(&mut self) {
-        if self.state != SortState::Changed {
-            self.state = SortState::Changed;
-        }
+        self.state = SortState::Changed;
     }
 
     /**
@@ -242,6 +240,22 @@ impl<T> EnhVecInner<T> {
         self.head.iter_mut().rev().chain(self.main.iter_mut())
     }
 
+    /**
+    Whether logical `index` is in the head, and its position in that Vec.
+    Written so that the Vec is picked with a conditional move instead of a
+    jump, which the CPU would mispredict when reads hit head and main at
+    random. An out of bounds position is caught by the slice indexing.
+    */
+    #[inline]
+    fn locate(&self, index: usize) -> (bool, usize) {
+        let head_len: usize = self.head.len();
+        let in_head: bool = index < head_len;
+        // head elements are in reverse order -> reverse the index
+        let head_pos: usize = head_len.wrapping_sub(1).wrapping_sub(index);
+        let main_pos: usize = index.wrapping_sub(head_len);
+        (in_head, if in_head { head_pos } else { main_pos })
+    }
+
     fn get(&self, index: usize) -> Option<&T> {
         if index >= self.len() {
             None
@@ -266,13 +280,9 @@ impl<T> Index<usize> for EnhVecInner<T> {
     type Output = T;
 
     fn index(&self, index: usize) -> &Self::Output {
-        let head_len: usize = self.head.len();
-        if index < head_len {
-            // head elements are in reverse order -> reverse the index
-            &self.head[head_len - 1 - index]
-        } else {
-            &self.main[index - head_len]
-        }
+        let (in_head, i): (bool, usize) = self.locate(index);
+        let slice: &[T] = if in_head { &self.head } else { &self.main };
+        &slice[i]
     }
 }
 
@@ -281,12 +291,13 @@ impl<T> IndexMut<usize> for EnhVecInner<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         // mutation could change the sort order of elements
         self.set_changed();
-        let head_len: usize = self.head.len();
-        if index < head_len {
-            &mut self.head[head_len - 1 - index]
+        let (in_head, i): (bool, usize) = self.locate(index);
+        let slice: &mut [T] = if in_head {
+            &mut self.head
         } else {
-            &mut self.main[index - head_len]
-        }
+            &mut self.main
+        };
+        &mut slice[i]
     }
 }
 
@@ -360,7 +371,8 @@ impl<T: PartialOrd> EnhVecInner<T> {
 
     fn push(&mut self, element: T) {
         self.main.push(element);
-        if self.order_changed(self.len() - 1) {
+        // nothing to check once the order is known to have changed
+        if self.state != SortState::Changed && self.order_changed(self.len() - 1) {
             self.set_changed();
         }
     }
@@ -368,7 +380,7 @@ impl<T: PartialOrd> EnhVecInner<T> {
     fn push_front(&mut self, element: T) {
         // the head is a reversed Vec, so this is a plain (amortized O(1)) push
         self.head.push(element);
-        if self.order_changed(0) {
+        if self.state != SortState::Changed && self.order_changed(0) {
             self.set_changed();
         }
     }
