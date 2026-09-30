@@ -166,11 +166,11 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
-- Unreleased
+- 0.5.3: Faster float sums, sorting and hashing
     - Float sums in `average_fp()`, `variance_fp()` and `variance()` use independent partial sums: ~6x faster on large data
     - `sort_unstable()` and `sort_unstable_by()`, ~1.5x faster than `sort()`, also used by `distinct()`
     - Order-independent hashing from per-element digests instead of a sort: ~25x faster for unsorted data, ~2x for sorted, and `Hash`/`Xxh3Hashable` no longer require `Ord`
-    - Breaking: `Hash`/`xxh3` values change, and a `custom_xxh3` with `QuickXxh3Hasher` is required
+    - Breaking: `Hash`/`xxh3` values change, and `custom_xxh3` 0.3.1 or later is required
 - 0.5.2: VecDeque-level operations at both ends, Vec/VecDeque comparison bench
     - Amortized `O(1)` `pop_front()` and `pop()` in any mix (two-stack deque), faster indexing and pushes, `benches/vs_std.rs`
     - `insert()`/`insert_sorted()` shift at most about half of the elements (head/main rebalancing)
