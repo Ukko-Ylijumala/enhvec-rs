@@ -1,4 +1,4 @@
-// Copyright (c) 2024-2025 Mikko Tanner. All rights reserved.
+// Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
 use custom_xxh3::{CustomXxh3Hasher, Xxh3Hashable};
 use std::{
@@ -374,7 +374,7 @@ impl<T: PartialOrd> EnhVecInner<T> {
                 if idx == self.len() - 1 {
                     return self[idx - 1] > self[idx];
                 }
-                return self[idx - 1] > self[idx] || self[idx] > self[idx + 1];
+                self[idx - 1] > self[idx] || self[idx] > self[idx + 1]
             }
             SortState::Desc => {
                 if idx == 0 {
@@ -383,7 +383,7 @@ impl<T: PartialOrd> EnhVecInner<T> {
                 if idx == self.len() - 1 {
                     return self[idx - 1] < self[idx];
                 }
-                return self[idx - 1] < self[idx] || self[idx] < self[idx + 1];
+                self[idx - 1] < self[idx] || self[idx] < self[idx + 1]
             }
         }
     }
@@ -522,12 +522,6 @@ impl<T: PartialEq + PartialOrd> EnhVec<T> {
             ..Self::default()
         }
     }
-    pub fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        Self {
-            data: iter.into_iter().collect::<Vec<T>>().into(),
-            ..Self::default()
-        }
-    }
 
     /// Insert an element at index. Possibly slow, as it may shift other elements.
     pub fn insert(&mut self, idx: usize, element: T) {
@@ -615,7 +609,7 @@ impl<T> EnhVec<T> {
         })
     }
 
-    /// Clone the elements into a new regular [Vec<T>].
+    /// Clone the elements into a new regular [`Vec<T>`].
     pub fn to_vec(&self) -> Vec<T>
     where
         T: Clone,
@@ -626,7 +620,7 @@ impl<T> EnhVec<T> {
         data
     }
 
-    /// Consume the [EnhVec] and return the inner [Vec<T>].
+    /// Consume the [EnhVec] and return the inner [`Vec<T>`].
     /// Time complexity: `O(1)` if there is nothing in the head, else `O(N)`.
     pub fn into_vec(mut self) -> Vec<T> {
         self.data.compact();
@@ -689,7 +683,7 @@ impl<T> EnhVec<T> {
     pub fn extend<I>(&mut self, iter: I)
     where I: IntoIterator<Item = T>,
     {
-        self.data.main.extend(iter.into_iter());
+        self.data.main.extend(iter);
         self.data.set_changed();
     }
 
@@ -931,6 +925,13 @@ impl<T: PartialEq + PartialOrd> From<Vec<T>> for EnhVec<T> {
     }
 }
 
+// Allow `EnhVec::from_iter()` as well as `.collect::<EnhVec<T>>()`
+impl<T: PartialEq + PartialOrd> FromIterator<T> for EnhVec<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self::new_from(iter.into_iter().collect())
+    }
+}
+
 /* ############################### Iterators ############################### */
 
 /**
@@ -1002,7 +1003,7 @@ impl<'a, T> ExactSizeIterator for EnhVecIterMut<'a, T> {}
 
 /* --------------------------------- */
 
-impl<'a, T> IntoIterator for EnhVec<T> {
+impl<T> IntoIterator for EnhVec<T> {
     type Item = T;
     type IntoIter = std::vec::IntoIter<T>;
 
@@ -1149,9 +1150,9 @@ impl<T: Copy + Eq + Hash> EnhVec<T> {
         T: Copy + Eq + Hash + Ord,
     {
         let set: HashSet<T> = self.data.internal_iter().copied().collect();
-        let mut result: EnhVec<T> = EnhVec::from_iter(set.into_iter());
-        if sorted.is_some() {
-            result.sort(sorted.unwrap());
+        let mut result: EnhVec<T> = EnhVec::from_iter(set);
+        if let Some(sorting) = sorted {
+            result.sort(sorting);
         }
         result
     }
@@ -1187,7 +1188,7 @@ impl<T: Integer> EnhVec<T> {
 
         let mid: usize = self.len() / 2;
 
-        if self.len() % 2 == 0 {
+        if self.len().is_multiple_of(2) {
             // unlike `(a + b) / 2`, midpoint() cannot overflow
             let (below, above): (T, Option<T>) = self.select_asc(mid - 1, true);
             above.map(|above: T| T::midpoint(below, above))
@@ -1249,7 +1250,7 @@ impl<T: Integer> EnhVec<T> {
         self.variance().map(|v: f64| v.sqrt())
     }
 
-    /// Return the percentile value of the elements. NOTE: `0.0 <=` [p] `<= 1.0`
+    /// Return the percentile value of the elements. NOTE: `0.0 <= p <= 1.0`
     pub fn percentile(&self, p: f64) -> Option<T> {
         // written as !contains() so that a NaN `p` is rejected as well
         if self.is_empty() || !(0.0..=1.0).contains(&p) {
@@ -1274,7 +1275,7 @@ impl<T: Float> EnhVec<T> {
         let mut data: Vec<T> = self.to_vec();
         let mid: usize = data.len() / 2;
 
-        if data.len() % 2 == 0 {
+        if data.len().is_multiple_of(2) {
             // unlike `(a + b) / 2`, midpoint() cannot overflow to infinity
             let (below, above): (T, Option<T>) = select_by(&mut data, mid - 1, true, T::total_cmp);
             above.map(|above: T| T::midpoint(below, above))
@@ -1322,7 +1323,7 @@ impl<T: Float> EnhVec<T> {
     }
 
     /// Return the percentile value of the elements. Floating point version.
-    /// NOTE: `0.0 <=` [p] `<= 1.0`. NaNs are ordered by `total_cmp()`.
+    /// NOTE: `0.0 <= p <= 1.0`. NaNs are ordered by `total_cmp()`.
     pub fn percentile_fp(&self, p: f64) -> Option<T> {
         // written as !contains() so that a NaN `p` is rejected as well
         if self.is_empty() || !(0.0..=1.0).contains(&p) {
@@ -1495,13 +1496,15 @@ where
 }
 
 /// Sort a vector in place, based on the current and desired sorting state.
-fn sort_vec<T: Ord>(v: &mut Vec<T>, state: &SortState, desired: &Sorting) {
+fn sort_vec<T: Ord>(v: &mut [T], state: &SortState, desired: &Sorting) {
     // short circuit no-ops
-    if matches!(v.len(), 0 | 1) || *desired == Sorting::None {
-        return;
-    } else if *state == SortState::Asc && *desired == Sorting::Ascending {
-        return;
-    } else if *state == SortState::Desc && *desired == Sorting::Descending {
+    let noop: bool = matches!(
+        (state, desired),
+        (_, Sorting::None)
+            | (SortState::Asc, Sorting::Ascending)
+            | (SortState::Desc, Sorting::Descending)
+    );
+    if noop || v.len() < 2 {
         return;
     }
 
@@ -1687,7 +1690,7 @@ mod tests {
         assert_eq!(sum, PI_SUM, "sum of all digits");
 
         let mut sum_if: u32 = 0;
-        ev.for_each_if(|x: &u32| sum_if += x, |x: &u32| x % 2 == 0);
+        ev.for_each_if(|x: &u32| sum_if += x, |x: &u32| x.is_multiple_of(2));
         assert_eq!(sum_if, 20, "sum of even digits");
     }
 
@@ -1813,7 +1816,7 @@ mod tests {
     #[rustfmt::skip]
     fn test_average_fp() {
         let ev: EnhVec<f32> = EnhVec::from_iter(FP_ARR.iter().map(|&x| x as f32));
-        let diff: f32 = ev.average_fp().unwrap() - 2.142857143; // 15 / 7
+        let diff: f32 = ev.average_fp().unwrap() - 15.0 / 7.0;
         assert!(diff.abs() < EPSILON as f32, "avg diff ({diff}) not within epsilon");
     }
 
