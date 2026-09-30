@@ -167,8 +167,9 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
-- Unreleased
-    - The head keeps its elements in their normal order, with free space at both ends: faster sorted inserts, `push_swap_front()` and indexing, `pop()` needs no refill
+- 0.5.4: Head in normal order, with free space at both ends
+    - Faster sorted inserts, `push_swap_front()` and indexing, `pop()` needs no refill, the head grows 8x/4x/2x as it gets larger
+    - `benches/vs_std.rs` keeps freed memory in the process (glibc), so that it measures the containers instead of page faults
 - 0.5.3: Faster float sums, sorting and hashing
     - Float sums in `average_fp()`, `variance_fp()` and `variance()` use independent partial sums: ~6x faster on large data
     - `sort_unstable()` and `sort_unstable_by()`, ~1.5x faster than `sort()`, also used by `distinct()`
