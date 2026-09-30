@@ -139,7 +139,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
-- Unreleased
+- 0.5.1: Minor fixes, API gaps and faster set operations
     - `Default` no longer requires `T: Default`, `sort_by()` no longer requires `Ord` (e.g. `sort_by(f64::total_cmp)`)
     - Deterministic `mode()` ties and `distinct()` order, no overflow in `average_fp()`
     - `Extend` (also from `&T`), double-ended, fused and cloneable iterators
