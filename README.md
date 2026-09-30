@@ -72,6 +72,7 @@ let unique = vec.distinct(Some(Sorting::Ascending));
 - `extend()` (the `Extend` trait, also from `&T` for `Copy` types), `extend_sorted()`, `append()`
 - `reverse()`, `sort()`, `sort_by()`, `sort_unstable()`, `sort_unstable_by()`, `is_sorted()`, `as_sorted_asc()`, `as_sorted_desc()`
 - `get()`, `get_mut()`, indexing, `first()`, `last()`, `to_vec()`, `into_vec()`
+- `as_slice()`, `as_mut_slice()`, `AsRef<[T]>`: the elements are always one slice, in order
 - `iter()`, `iter_mut()` (double-ended, e.g. `iter().rev()`), `IntoIterator` for `EnhVec` and its references
 - `for_each()`, `for_each_if()`, `modify_each()`, `modify_each_if()`, `count()`, `contains()`
 
@@ -181,6 +182,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
     - The elements are always one slice: indexing and iteration run at `Vec` speed, `From<Vec<T>>` and `into_vec()` reuse the buffer
     - Pushes as fast as `Vec::push()`, `O(1)` pops at both ends without moving elements (2-7x faster), faster queues; sorted inserts ~20% slower, as one buffer shifts more elements than two
     - `swap_pop_front()` is the same as `pop_front()`, `push_swap_front()` moves the first element to the back when there is no free space at the front
+    - `as_slice()`, `as_mut_slice()` and `AsRef<[T]>`
 - 0.5.4: Head in normal order, with free space at both ends
     - Faster sorted inserts, `push_swap_front()` and indexing, `pop()` needs no refill, the head grows 8x/4x/2x as it gets larger
     - `benches/vs_std.rs` keeps freed memory in the process (glibc), so that it measures the containers instead of page faults

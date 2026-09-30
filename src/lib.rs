@@ -768,6 +768,21 @@ impl<T> EnhVec<T> {
         }
     }
 
+    /**
+    The elements as a slice, in order, for any slice method (e.g.
+    `windows()`, `binary_search()`) or code taking a `&[T]`. Time
+    complexity: `O(1)`, the elements are always contiguous.
+    */
+    pub fn as_slice(&self) -> &[T] {
+        self.data.as_slice()
+    }
+    /// The elements as a mutable slice, in order. The sort state is reset,
+    /// as the order of the elements could change (like with `iter_mut()`).
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        self.data.set_changed();
+        self.data.as_mut_slice()
+    }
+
     /// Return a [Vec] of references to entries.
     pub fn as_ref_vec(&self) -> Vec<&T> {
         self.data.internal_iter().collect()
@@ -1231,6 +1246,17 @@ impl<T> Index<usize> for EnhVec<T> {
 impl<T> IndexMut<usize> for EnhVec<T> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.data[index]
+    }
+}
+
+/**
+Borrow the elements as a slice, see `as_slice()`. There is no `Borrow<[T]>`,
+as that requires equal hashes, and the [Hash] of an [EnhVec] ignores the
+order of the elements, while that of a slice does not.
+*/
+impl<T> AsRef<[T]> for EnhVec<T> {
+    fn as_ref(&self) -> &[T] {
+        self.as_slice()
     }
 }
 
@@ -2134,6 +2160,23 @@ mod tests {
         let ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
         let test: Vec<&u32> = PI_ARR.iter().collect();
         assert_eq!(ev.as_ref_vec(), test);
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_as_slice() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter([3, 4]);
+        ev.push_front(2);
+        ev.push_front(1);
+        assert_eq!(ev.as_slice(), &[1, 2, 3, 4]);
+        let slice: &[u32] = ev.as_ref();
+        assert_eq!(slice.binary_search(&3), Ok(2), "slice methods");
+
+        ev.sort(Sorting::Descending);
+        ev.as_mut_slice().swap(0, 3);
+        assert!(!ev.data.state.is_sorted(), "as_mut_slice() resets the sort state");
+        ev.sort(Sorting::Descending);
+        assert_eq!(ev.as_slice(), &[4, 3, 2, 1], "sorted again");
     }
 
     #[test]
