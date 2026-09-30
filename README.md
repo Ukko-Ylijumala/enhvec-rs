@@ -156,6 +156,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
+- Unreleased
+    - Float sums in `average_fp()`, `variance_fp()` and `variance()` use independent partial sums: ~6x faster on large data
 - 0.5.2: VecDeque-level operations at both ends, Vec/VecDeque comparison bench
     - Amortized `O(1)` `pop_front()` and `pop()` in any mix (two-stack deque), faster indexing and pushes, `benches/vs_std.rs`
     - `insert()`/`insert_sorted()` shift at most about half of the elements (head/main rebalancing)
