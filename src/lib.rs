@@ -379,8 +379,7 @@ impl<T: PartialOrd> EnhVecInner<T> {
 
 impl<T: Ord> EnhVecInner<T> {
     fn sort(&mut self, sorting: &Sorting) {
-        // set changed so that compact() doesn't do extra work
-        self.set_changed();
+        // compact() keeps the order, so sort_vec() can trust the current state
         self.compact();
         sort_vec(&mut self.main, &self.state, sorting);
         self.state = match sorting {
@@ -676,6 +675,7 @@ impl<T> EnhVec<T> {
         EnhVecIter::new(&self.data.head, &self.data.main)
     }
     pub fn iter_mut(&mut self) -> EnhVecIterMut<'_, T> {
+        self.data.set_changed(); // order of elements could change
         EnhVecIterMut::new(&mut self.data.head, &mut self.data.main)
     }
 
@@ -745,25 +745,28 @@ impl<T: Ord> EnhVec<T> {
         self.data.insert_sorted(element);
     }
 
-    /// Set the default sorting state of the [EnhVec] and sort the data.
+    /**
+    Set the default sorting state of the [EnhVec] and sort the data.
+    Cheap if the data is already known to be in the requested order: a no-op
+    when it is, and a reversal when it is known to be in the opposite order.
+    */
     pub fn sort(&mut self, sorting: Sorting) {
-        if sorting == self.sort {
-            return;
-        }
         self.data.sort(&sorting);
         self.sort = sorting;
     }
 
     /// Use a comparison Fn to sort the elements. Passthrough to Vec::sort_by().
+    /// Clears the default [Sorting], as the resulting order is custom.
     pub fn sort_by<F>(&mut self, f: F)
     where
         F: FnMut(&T, &T) -> Ordering,
     {
         self.data.sort_by(f);
+        self.sort = Sorting::None;
     }
 
-    /// Extend this [EnhVec] from an iterator. If the original elements are
-    /// sorted, we will re-sort after the extension.
+    /// Extend this [EnhVec] from an iterator. If a default [Sorting] is set
+    /// (see `sort()` and `new_sorted()`), we will re-sort after the extension.
     pub fn extend_sorted<I>(&mut self, iter: I)
     where I: IntoIterator<Item = T>,
     {
@@ -1834,5 +1837,65 @@ mod tests {
         let mut test: Vec<u32> = Vec::from_iter(PI_DESC);
         test.insert(10, 4);
         assert_eq!(ev.to_vec(), test, "DESC data, unknown state");
+    }
+
+    #[test]
+    fn test_sort_after_mutation() {
+        let assert_asc = |ev: &EnhVec<u32>, msg: &str| {
+            let mut test: Vec<u32> = ev.to_vec();
+            test.sort();
+            assert_eq!(ev.to_vec(), test, "{msg}");
+        };
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        ev.sort(Sorting::Ascending);
+        ev.push(0);
+        ev.sort(Sorting::Ascending);
+        assert_asc(&ev, "after push()");
+        ev[0] = XTRA;
+        ev.sort(Sorting::Ascending);
+        assert_asc(&ev, "after IndexMut");
+        ev.sort_by(|a: &u32, b: &u32| b.cmp(a));
+        ev.sort(Sorting::Ascending);
+        assert_asc(&ev, "after sort_by()");
+        ev.iter_mut().for_each(|x: &mut u32| *x = XTRA - *x);
+        ev.sort(Sorting::Ascending);
+        assert_asc(&ev, "after iter_mut()");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_iter_mut_resets_state() {
+        let mut ev: EnhVec<i32> = EnhVec::from_iter([1, 2, 3]);
+        ev.sort(Sorting::Ascending);
+        ev.iter_mut().for_each(|x: &mut i32| *x = -*x);
+        assert!(!ev.is_sorted(), "is_sorted after iter_mut()");
+        assert_eq!(ev.as_sorted_asc(), vec![&-3, &-2, &-1], "as_sorted_asc after iter_mut()");
+        assert_eq!(ev.percentile(0.0), Some(-3), "min after iter_mut()");
+
+        ev.sort(Sorting::Ascending);
+        for x in &mut ev {
+            *x = -*x;
+        }
+        assert!(!ev.is_sorted(), "is_sorted after &mut iteration");
+        assert_eq!(ev.as_sorted_asc(), vec![&1, &2, &3], "as_sorted_asc after &mut iteration");
+    }
+
+    #[test]
+    fn test_extend_sorted() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter([1, 5]);
+        ev.sort(Sorting::Ascending);
+        ev.extend_sorted([3, 0]);
+        assert_eq!(ev.to_vec(), vec![0, 1, 3, 5], "ASC");
+        ev.sort(Sorting::Descending);
+        ev.extend_sorted([4, XTRA]);
+        assert_eq!(ev.to_vec(), vec![XTRA, 5, 4, 3, 1, 0], "DESC");
+
+        let mut ev: EnhVec<u32> = EnhVec::new_sorted(Sorting::Ascending);
+        ev.extend_sorted(PI_ARR);
+        assert_eq!(ev.to_vec(), Vec::from_iter(PI_ASC), "new_sorted()");
+        ev.extend(PI_ARR);
+        ev.sort(Sorting::Ascending);
+        assert_eq!(ev.len(), 2 * PI_LEN, "sort() after extend()");
+        assert!(ev.is_sorted(), "sort() after extend()");
     }
 }
