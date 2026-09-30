@@ -202,10 +202,64 @@ impl<T> DeBuf<T> {
         Some(unsafe { self.buf.get_unchecked(self.end).assume_init_read() })
     }
 
+    /// The number of element slots in the buffer, used or not.
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Make sure that `n` more elements fit at the back.
     fn reserve_back(&mut self, n: usize) {
         if self.buf.len() - self.end < n {
             self.make_room(n, false);
+        }
+    }
+
+    /// Make sure that `n` more elements fit at the front.
+    fn reserve_front(&mut self, n: usize) {
+        if self.start < n {
+            self.make_room(n, true);
+        }
+    }
+
+    /// Release the free space at both ends: the elements move to the start
+    /// of the buffer, which then shrinks like a Vec.
+    fn shrink_to_fit(&mut self) {
+        let mut elements: Vec<T> = mem::replace(self, Self::new()).into_vec();
+        elements.shrink_to_fit();
+        *self = Self::from_vec(elements);
+    }
+
+    /// Push clones of the elements of `other` to the back.
+    fn extend_from_slice(&mut self, other: &[T])
+    where
+        T: Clone,
+    {
+        /*
+        The end is kept in a local and set once at the end, which lets the
+        loop compile to a copy for Copy types. Should a clone() panic, the
+        guard still sets it, after the elements cloned so far.
+        */
+        struct SetEndOnDrop<'a> {
+            end: &'a mut usize,
+            local: usize,
+        }
+        impl Drop for SetEndOnDrop<'_> {
+            fn drop(&mut self) {
+                *self.end = self.local;
+            }
+        }
+
+        self.reserve_back(other.len());
+        let (from, to): (usize, usize) = (self.end, self.end + other.len());
+        let slots: &mut [MaybeUninit<T>] = &mut self.buf[from..to];
+        let mut end: SetEndOnDrop = SetEndOnDrop {
+            end: &mut self.end,
+            local: from,
+        };
+        for (slot, x) in slots.iter_mut().zip(other) {
+            slot.write(x.clone());
+            end.local += 1;
         }
     }
 
@@ -1097,6 +1151,53 @@ impl<T> EnhVec<T> {
             data,
             sort: self.sort,
         }
+    }
+
+    /**
+    The number of elements the buffer has room for, used or not. The free
+    room is before and after the elements: a push at either end reallocates
+    when that end runs out of it (unless the buffer is at most half full,
+    when the elements are moved instead), so that fewer elements may fit
+    without reallocating. See `reserve()` and `reserve_front()`.
+    */
+    pub fn capacity(&self) -> usize {
+        self.data.buf.capacity()
+    }
+
+    /// Make room for at least `additional` more elements at the back, so that
+    /// as many `push()` or `extend()` calls do not reallocate. Like `Vec::reserve()`,
+    /// it may reserve more, to keep the pushes amortized `O(1)`.
+    pub fn reserve(&mut self, additional: usize) {
+        self.data.buf.reserve_back(additional);
+    }
+
+    /// Make room for at least `additional` more elements at the front, so
+    /// that as many `push_front()` calls neither reallocate nor move elements.
+    pub fn reserve_front(&mut self, additional: usize) {
+        self.data.buf.reserve_front(additional);
+    }
+
+    /**
+    Shrink the buffer to fit the elements, releasing the free space at both
+    ends: the elements move to the start of the buffer, which then shrinks
+    like with `Vec::shrink_to_fit()`. Worth it after growing at the front,
+    as small buffers grow 8x there. Keeps a known order.
+    */
+    pub fn shrink_to_fit(&mut self) {
+        self.data.buf.shrink_to_fit();
+    }
+
+    /**
+    Push clones of the elements of `other` to the back, like
+    `Vec::extend_from_slice()`: for `Copy` types a plain copy, where
+    `extend()` pushes one element at a time. The sort state is reset.
+    */
+    pub fn extend_from_slice(&mut self, other: &[T])
+    where
+        T: Clone,
+    {
+        self.data.buf.extend_from_slice(other);
+        self.data.set_changed();
     }
 
     pub fn get(&self, index: usize) -> Option<&T> {
@@ -3516,6 +3617,66 @@ mod tests {
 
     #[test]
     #[rustfmt::skip]
+    fn test_capacity() {
+        let mut ev: EnhVec<u32> = EnhVec::new();
+        ev.push_front(0);
+        ev.reserve(100);
+        assert!(ev.capacity() >= 101, "room for 100 more");
+        let (ptr, start): (*const MaybeUninit<u32>, usize) = (ev.data.buf.buf.as_ptr(), ev.data.buf.start);
+        (1..=100).for_each(|x: u32| ev.push(x));
+        assert_eq!((ev.data.buf.buf.as_ptr(), ev.data.buf.start), (ptr, start), "no reallocation or moves");
+
+        ev.reserve_front(100);
+        let (ptr, end): (*const MaybeUninit<u32>, usize) = (ev.data.buf.buf.as_ptr(), ev.data.buf.end);
+        (0..100).for_each(|x: u32| ev.push_front(x));
+        assert_eq!((ev.data.buf.buf.as_ptr(), ev.data.buf.end), (ptr, end), "none at the front either");
+
+        ev.sort(Sorting::Ascending);
+        let expected: Vec<u32> = ev.to_vec();
+        ev.shrink_to_fit();
+        assert_eq!(ev.capacity(), ev.len(), "shrunk");
+        assert_eq!(ev.as_slice(), expected, "the same elements");
+        assert!(ev.data.state == SortState::Asc, "the known order kept");
+        ev.push_front(0);
+        ev.push(1000);
+        assert_eq!(ev.len(), expected.len() + 2, "grows again at both ends");
+    }
+
+    #[test]
+    fn test_extend_from_slice() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter([1, 2]);
+        ev.push_front(0);
+        ev.extend_from_slice(&[3, 4, 5]);
+        ev.extend_from_slice(&[]);
+        assert_eq!(ev.as_slice(), &[0, 1, 2, 3, 4, 5]);
+    }
+
+    /// Boxed, so that Miri would find a leaked or doubly dropped value.
+    #[derive(Debug, PartialEq, PartialOrd)]
+    struct CloneBomb(Box<u32>);
+
+    impl Clone for CloneBomb {
+        fn clone(&self) -> Self {
+            assert!(*self.0 != 3, "clone() of 3");
+            Self(self.0.clone())
+        }
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_extend_from_slice_panic() {
+        let bomb = |x: u32| CloneBomb(Box::new(x));
+        let mut ev: EnhVec<CloneBomb> = EnhVec::from_iter([bomb(10)]);
+        let source: Vec<CloneBomb> = (0..5).map(bomb).collect();
+        let panicked: bool = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ev.extend_from_slice(&source)
+        })).is_err();
+        assert!(panicked, "panicked");
+        assert_eq!(ev.as_slice(), &[bomb(10), bomb(0), bomb(1), bomb(2)], "the clones before the panic");
+    }
+
+    #[test]
+    #[rustfmt::skip]
     fn test_vec_conversions_keep_the_buffer() {
         let mut ev: EnhVec<u32> = EnhVec::new_with_capacity(1000);
         let ptr: *const MaybeUninit<u32> = ev.data.buf.buf.as_ptr();
@@ -3746,7 +3907,7 @@ mod tests {
         let steps: usize = if cfg!(miri) { 300 } else { 3000 };
         for step in 0..steps {
             let x: usize = next(1000);
-            match next(14) {
+            match next(16) {
                 0 | 1 => {
                     buf.push_front(Counted::new(x, &live));
                     model.push_front(x);
@@ -3802,6 +3963,16 @@ mod tests {
                     let taken: Vec<usize> = buf.take_range(from..to).into_iter().map(|c: Counted| c.0).collect();
                     assert_eq!(taken, model.drain(from..to).collect::<Vec<usize>>(), "take_range, step {step}");
                 }
+                13 => {
+                    let source: Vec<Counted> = (x..x + next(20)).map(|v: usize| Counted::new(v, &live)).collect();
+                    buf.extend_from_slice(&source);
+                    model.extend(x..x + source.len());
+                }
+                14 => match x % 3 {
+                    0 => buf.shrink_to_fit(),
+                    1 => buf.reserve_back(next(20)),
+                    _ => buf.reserve_front(next(20)),
+                },
                 _ => {
                     let copy: DeBuf<Counted> = buf.clone();
                     assert!(copy.as_slice().iter().map(|c: &Counted| c.0).eq(model.iter().copied()));
@@ -3829,9 +4000,13 @@ mod tests {
         assert_eq!((buf.remove(3), buf.remove(200)), ((), ()));
         assert_eq!(buf.take_range(10..20).len(), 10);
         buf.truncate(200);
+        buf.extend_from_slice(&[(); 3]);
+        buf.reserve_front(10);
+        buf.reserve_back(10);
+        buf.shrink_to_fit();
         let v: Vec<()> = buf.into_vec();
-        assert_eq!(v.len(), 200);
-        assert_eq!(DeBuf::from_vec(v).clone().len(), 200);
+        assert_eq!(v.len(), 203);
+        assert_eq!(DeBuf::from_vec(v).clone().len(), 203);
     }
 
     #[test]

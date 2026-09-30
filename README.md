@@ -70,7 +70,8 @@ let unique = vec.distinct(Some(Sorting::Ascending));
 - `push()`, `push_front()`, `push_swap_front()`, `insert()`, `insert_sorted()`
 - `pop()`, `pop_front()`, `swap_pop_front()`, `remove()`, `truncate()`, `clear()`
 - `retain()`, `dedup()`, `drain()`, `split_off()`
-- `extend()` (the `Extend` trait, also from `&T` for `Copy` types), `extend_sorted()`, `append()`
+- `extend()` (the `Extend` trait, also from `&T` for `Copy` types), `extend_from_slice()`, `extend_sorted()`, `append()`
+- `capacity()`, `reserve()`, `reserve_front()`, `shrink_to_fit()`
 - `reverse()`, `sort()`, `sort_by()`, `sort_unstable()`, `sort_unstable_by()`, `sort_fp()`, `is_sorted()`, `as_sorted_asc()`, `as_sorted_desc()`
 - `get()`, `get_mut()`, indexing, `first()`, `last()`, `to_vec()`, `into_vec()`
 - `as_slice()`, `as_mut_slice()`, `Deref`/`DerefMut` to `[T]`, `AsRef<[T]>`/`AsMut<[T]>`, indexing with ranges (`ev[1..3]`), `binary_search()`
@@ -95,6 +96,12 @@ lookups in 1M elements, and 3-18x for the rest.
 The removals keep the order of the other elements, so a known order stays known.
 `remove()` moves the shorter part of the other elements, like `VecDeque`. `drain()` moves the
 elements out right away, into a Vec of their own, so its iterator does not borrow the `EnhVec`.
+
+`capacity()` counts the free room at both ends. `reserve()` makes room at the back and
+`reserve_front()` at the front, so that as many pushes there neither reallocate nor move elements.
+`shrink_to_fit()` releases the room at both ends, which is worth it after growing at the front,
+where small buffers grow 8x. `extend_from_slice()` copies like `Vec::extend_from_slice()`, where
+`extend()` pushes one element at a time (~4x slower for 10k `u64`s).
 
 `sort_unstable()` and `sort_unstable_by()` may reorder equal elements, but are ~1.5x faster and
 allocate nothing. For numbers, and other types whose equal elements are indistinguishable, the
@@ -197,6 +204,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
+- Unreleased: Capacity control, `extend_from_slice()`
+    - `capacity()`, `reserve()`, `reserve_front()`, `shrink_to_fit()`, and `extend_from_slice()` as fast as `Vec`'s
 - 0.6.2: Vec methods that keep a known order
     - `remove()`, `truncate()`, `clear()`, `retain()`, `dedup()`, `drain()` and `split_off()`
 - 0.6.1: Slice API, faster lookups in a known order, `sort_fp()`
