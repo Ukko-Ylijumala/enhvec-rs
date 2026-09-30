@@ -192,7 +192,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
-- Unreleased: Slice API, faster lookups in a known order, `sort_fp()`
+- 0.6.1: Slice API, faster lookups in a known order, `sort_fp()`
     - `Deref`/`DerefMut` to `[T]`, `AsMut<[T]>`, indexing with ranges, `binary_search()` in the known order
     - With a known order: `contains()`, `count()` and the set operations binary search, and `mode()`, `distinct()` and `set_relation_sorted()` need no hashing or sorting
     - `sort_fp()` gives floats a known order: `O(1)` `median_fp()` and `percentile_fp()`, and binary searching `contains()` and `count()`
