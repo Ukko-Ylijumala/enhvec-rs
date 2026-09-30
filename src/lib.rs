@@ -8,9 +8,9 @@ use std::{
     hash::{Hash, Hasher},
     iter::{FusedIterator, Sum},
     mem::{self, ManuallyDrop, MaybeUninit},
-    ops::{Add, Div, Index, IndexMut, Mul, Sub},
+    ops::{Add, Deref, DerefMut, Div, Index, IndexMut, Mul, Sub},
     ptr,
-    slice::{self, Iter, IterMut},
+    slice::{self, Iter, IterMut, SliceIndex},
 };
 
 /// The default size cutoff for linear/binary search.
@@ -979,6 +979,22 @@ impl<T: Ord> EnhVec<T> {
         }
     }
 
+    /**
+    Binary search for `x` like `slice::binary_search()`, but in the known
+    order, also descending: `Ok` with the position of a matching element (any
+    of them, if several match), or `Err` with the position where `x` could be
+    inserted, keeping the order. Unless the order is known (after `sort()`,
+    or checked by `insert_sorted()`), the data is assumed to be ascending, as
+    with a slice. Time complexity: `O(log N)`.
+    */
+    pub fn binary_search(&self, x: &T) -> Result<usize, usize> {
+        match self.data.state {
+            // `y` belongs before `x` in descending order if it is greater
+            SortState::Desc => self.as_slice().binary_search_by(|y: &T| x.cmp(y)),
+            _ => self.as_slice().binary_search(x),
+        }
+    }
+
     /// Return references to entries in ASCending order.
     pub fn as_sorted_asc(&self) -> Vec<&T> {
         let mut vec: Vec<&T> = self.as_ref_vec();
@@ -1233,19 +1249,48 @@ impl<T: PartialEq> PartialEq for EnhVec<T> {
 
 impl<T: Eq> Eq for EnhVec<T> {}
 
-// Allow indexing into EnhVec
-impl<T> Index<usize> for EnhVec<T> {
-    type Output = T;
+// Allow indexing into EnhVec, with a position or a range (e.g. `ev[1..3]`), like a slice
+impl<T, I: SliceIndex<[T]>> Index<I> for EnhVec<T> {
+    type Output = I::Output;
 
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.data[index]
+    #[inline]
+    fn index(&self, index: I) -> &Self::Output {
+        &self.as_slice()[index]
     }
 }
 
-// Allow mutable indexing into EnhVec
-impl<T> IndexMut<usize> for EnhVec<T> {
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        &mut self.data[index]
+// Mutable indexing resets the sort state, as the order could change
+impl<T, I: SliceIndex<[T]>> IndexMut<I> for EnhVec<T> {
+    #[inline]
+    fn index_mut(&mut self, index: I) -> &mut Self::Output {
+        &mut self.as_mut_slice()[index]
+    }
+}
+
+/**
+An [EnhVec] is a slice like a [Vec] is, so all slice methods (e.g. `windows()`,
+`chunks()`, `split_at()`) work on it, and `&EnhVec<T>` coerces to `&[T]`. Its
+own methods of the same name (e.g. `contains()`, `is_sorted()`, `sort_by()`)
+come first. `binary_search()` is one of them, so that it follows the known
+order, also descending.
+*/
+impl<T> Deref for EnhVec<T> {
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+/**
+Mutable slice methods (e.g. `swap()`, `fill()`, `chunks_mut()`) reset the sort
+state, as with `as_mut_slice()`: any mutable access could change the order.
+*/
+impl<T> DerefMut for EnhVec<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [T] {
+        self.as_mut_slice()
     }
 }
 
@@ -1257,6 +1302,13 @@ order of the elements, while that of a slice does not.
 impl<T> AsRef<[T]> for EnhVec<T> {
     fn as_ref(&self) -> &[T] {
         self.as_slice()
+    }
+}
+
+// Borrow the elements as a mutable slice, which resets the sort state
+impl<T> AsMut<[T]> for EnhVec<T> {
+    fn as_mut(&mut self) -> &mut [T] {
+        self.as_mut_slice()
     }
 }
 
@@ -2177,6 +2229,52 @@ mod tests {
         assert!(!ev.data.state.is_sorted(), "as_mut_slice() resets the sort state");
         ev.sort(Sorting::Descending);
         assert_eq!(ev.as_slice(), &[4, 3, 2, 1], "sorted again");
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn test_deref_and_ranges() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter([3, 4, 5]);
+        ev.push_front(2);
+        ev.push_front(1);
+        assert_eq!(&ev[1..3], &[2, 3], "range");
+        assert_eq!(&ev[..], &[1, 2, 3, 4, 5], "full range");
+        assert_eq!(ev.windows(2).count(), 4, "slice method");
+        let len = |s: &[u32]| s.len();
+        assert_eq!(len(&ev), 5, "&EnhVec coerces to a slice");
+
+        ev.sort(Sorting::Ascending);
+        let _ = (ev.split_first(), &ev[1..]);
+        assert!(ev.data.state == SortState::Asc, "reading keeps the sort state");
+        ev[3..].reverse();
+        assert!(!ev.data.state.is_sorted(), "a mutable range resets the sort state");
+        ev.sort(Sorting::Ascending);
+        ev.swap(0, 4);
+        assert!(!ev.data.state.is_sorted(), "a mutable slice method resets the sort state");
+        ev.sort(Sorting::Ascending);
+        assert_eq!(ev.as_slice(), &[1, 2, 3, 4, 5], "sorted again");
+    }
+
+    #[test]
+    fn test_binary_search() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter([7, 3, 1, 5, 3]);
+        ev.sort(Sorting::Ascending);
+        assert_eq!(ev.binary_search(&5), Ok(3), "ASC");
+        assert_eq!(ev.binary_search(&4), Err(3), "ASC, missing");
+        assert!(matches!(ev.binary_search(&3), Ok(1 | 2)), "ASC, duplicate");
+
+        ev.sort(Sorting::Descending); // [7, 5, 3, 3, 1]
+        assert_eq!(ev.binary_search(&5), Ok(1), "DESC");
+        assert_eq!(ev.binary_search(&4), Err(2), "DESC, missing");
+        assert!(matches!(ev.binary_search(&3), Ok(2 | 3)), "DESC, duplicate");
+        assert_eq!(ev.binary_search(&9), Err(0), "DESC, before the first");
+        assert_eq!(ev.binary_search(&0), Err(5), "DESC, after the last");
+
+        // the insert position keeps the order
+        let pos: usize = ev.binary_search(&4).unwrap_err();
+        ev.insert(pos, 4);
+        assert_eq!(ev.as_slice(), &[7, 5, 4, 3, 3, 1]);
+        assert!(ev.data.state == SortState::Desc, "still known to be DESC");
     }
 
     #[test]

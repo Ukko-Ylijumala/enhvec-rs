@@ -72,7 +72,7 @@ let unique = vec.distinct(Some(Sorting::Ascending));
 - `extend()` (the `Extend` trait, also from `&T` for `Copy` types), `extend_sorted()`, `append()`
 - `reverse()`, `sort()`, `sort_by()`, `sort_unstable()`, `sort_unstable_by()`, `is_sorted()`, `as_sorted_asc()`, `as_sorted_desc()`
 - `get()`, `get_mut()`, indexing, `first()`, `last()`, `to_vec()`, `into_vec()`
-- `as_slice()`, `as_mut_slice()`, `AsRef<[T]>`: the elements are always one slice, in order
+- `as_slice()`, `as_mut_slice()`, `Deref`/`DerefMut` to `[T]`, `AsRef<[T]>`/`AsMut<[T]>`, indexing with ranges (`ev[1..3]`), `binary_search()`
 - `iter()`, `iter_mut()` (double-ended, e.g. `iter().rev()`), `IntoIterator` for `EnhVec` and its references
 - `for_each()`, `for_each_if()`, `modify_each()`, `modify_each_if()`, `count()`, `contains()`
 
@@ -80,6 +80,11 @@ let unique = vec.distinct(Some(Sorting::Ascending));
 new element takes the first place and the element there moves to the back. So the order of the
 other elements is not preserved. `swap_pop_front()` is the same as `pop_front()`, which is now
 `O(1)` in every call.
+
+The elements are always one slice, in order, so all slice methods work on an `EnhVec` (e.g.
+`windows()`, `chunks()`, `split_at()`), and `&EnhVec<T>` coerces to `&[T]`. Mutable access
+(`as_mut_slice()`, mutable slice methods or indexing) resets the known sort order.
+`binary_search()` follows the known order, so it also works on data sorted in descending order.
 
 `sort_unstable()` and `sort_unstable_by()` may reorder equal elements, but are ~1.5x faster and
 allocate nothing. For numbers, and other types whose equal elements are indistinguishable, the
@@ -178,6 +183,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
+- Unreleased: Slice API
+    - `Deref`/`DerefMut` to `[T]`, `AsMut<[T]>`, indexing with ranges, `binary_search()` in the known order
 - 0.6.0: One buffer for all elements, with free space at both ends
     - The elements are always one slice: indexing and iteration run at `Vec` speed, `From<Vec<T>>` and `into_vec()` reuse the buffer
     - Pushes as fast as `Vec::push()`, `O(1)` pops at both ends without moving elements (2-7x faster), faster queues; sorted inserts ~20% slower, as one buffer shifts more elements than two
