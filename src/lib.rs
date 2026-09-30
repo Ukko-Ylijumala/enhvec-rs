@@ -144,15 +144,20 @@ impl<T> EnhVecInner<T> {
             if self.main.is_empty() {
                 None
             } else {
-                if self.state.is_unsorted() {
-                    // if the main Vec is unsorted, we can just swap-remove
-                    return Some(self.main.swap_remove(0));
-                }
-                // removing the first element of a sorted Vec does not
-                // change the ordering, so we can just remove it
                 Some(self.main.remove(0))
             }
         })
+    }
+
+    /// Like `pop_front()`, but swap-removes from an unsorted main Vec.
+    fn swap_pop_front(&mut self) -> Option<T> {
+        if self.head.is_empty() && !self.main.is_empty() && self.state.is_unsorted() {
+            // no known order to maintain, so we can just swap-remove
+            return Some(self.main.swap_remove(0));
+        }
+        // removing the first element of a sorted Vec does not
+        // change the ordering, so we can just remove it
+        self.pop_front()
     }
 
     /**
@@ -618,8 +623,20 @@ impl<T> EnhVec<T> {
         self.data.pop()
     }
 
+    /// Remove and return the first element. Order of the remaining elements
+    /// is preserved. Time complexity: `O(1)` from the head, else `O(N)`.
     pub fn pop_front(&mut self) -> Option<T> {
         self.data.pop_front()
+    }
+
+    /**
+    Remove and return the first element. The counterpart of `push_swap_front()`:
+    if the data is not sorted, the last element may be moved to the front
+    instead of shifting all other elements. Sorted data stays sorted.
+    Time complexity: `O(1)` for unsorted data, else like `pop_front()`.
+    */
+    pub fn swap_pop_front(&mut self) -> Option<T> {
+        self.data.swap_pop_front()
     }
 
     pub fn get(&self, index: usize) -> Option<&T> {
@@ -1361,6 +1378,7 @@ fn sort_vec<T: Ord>(v: &mut Vec<T>, state: &SortState, desired: &Sorting) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::iter::from_fn;
 
     const PI_LEN: usize = 16;
     const PI_SUM: u32 = 80;
@@ -1694,5 +1712,32 @@ mod tests {
         test.push(0);
         assert_eq!(sorted.to_vec(), test);
         assert_eq!(sorted.as_sorted_desc(), test.iter().collect::<Vec<&u32>>());
+    }
+
+    #[test]
+    fn test_pop_front_keeps_order() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        ev.push_front(XTRA);
+        let popped: Vec<u32> = from_fn(|| ev.pop_front()).collect();
+        let mut test: Vec<u32> = Vec::from_iter(PI_ARR);
+        test.insert(0, XTRA);
+        assert_eq!(popped, test, "unsorted");
+
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        ev.sort_by(|a: &u32, b: &u32| b.cmp(a));
+        let popped: Vec<u32> = from_fn(|| ev.pop_front()).collect();
+        assert_eq!(popped, Vec::from_iter(PI_DESC), "custom sort_by() order");
+    }
+
+    #[test]
+    fn test_swap_pop_front() {
+        let mut ev: EnhVec<u32> = EnhVec::from_iter([1, 2, 3, 4]);
+        assert_eq!(ev.swap_pop_front(), Some(1));
+        assert_eq!(ev.to_vec(), vec![4, 2, 3], "unsorted: last one swapped in");
+
+        let mut ev: EnhVec<u32> = EnhVec::from_iter(PI_ARR);
+        ev.sort(Sorting::Ascending);
+        let popped: Vec<u32> = from_fn(|| ev.swap_pop_front()).collect();
+        assert_eq!(popped, Vec::from_iter(PI_ASC), "sorted: order kept");
     }
 }
