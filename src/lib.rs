@@ -1,6 +1,13 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
-use custom_xxh3::{hash_item, QuickXxh3Hasher, RandomXxh3Builder, Xxh3Hashable};
+use custom_xxh3::{QuickXxh3Hasher, Xxh3Hashable};
+#[cfg(not(feature = "std-hasher"))]
+use custom_xxh3::{hash_item, RandomXxh3Builder};
+#[cfg(feature = "std-hasher")]
+use std::{
+    hash::{BuildHasher, RandomState},
+    sync::LazyLock,
+};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -32,7 +39,15 @@ The hasher of the maps and sets built in `mode()`, `distinct()` and
 a random seed per map is ~2.5x faster than std's SipHash for integers,
 though not designed to resist collisions crafted by an attacker.
 */
+#[cfg(not(feature = "std-hasher"))]
 type ElemHasher = RandomXxh3Builder;
+/// With the `std-hasher` feature, std's SipHash with random keys per map.
+#[cfg(feature = "std-hasher")]
+type ElemHasher = RandomState;
+
+/// With the `std-hasher` feature, the keys of the element digests in `Hash`, drawn once per process.
+#[cfg(feature = "std-hasher")]
+static DIGEST_KEYS: LazyLock<RandomState> = LazyLock::new(RandomState::new);
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 /// The expected sorting state of an [EnhVec].
@@ -1897,7 +1912,9 @@ impl<T: Hash> Hash for EnhVec<T> {
     The element digests do not depend on the given hasher though, so its
     random keys only protect the final step: whoever controls the elements
     can search for colliding sets offline. Keep this in mind before using
-    EnhVecs of untrusted data as [HashMap] keys.
+    EnhVecs of untrusted data as [HashMap] keys, or enable the `std-hasher`
+    feature: the elements are then hashed with std's SipHash and random keys
+    drawn once per process, ~6x slower for integers and ~2x for short strings.
 
     To produce truly repeatable hashes, it is recommended to use the `xxh3()`
     or `xxh3_digest()` methods instead, which use a stable hasher.
@@ -1907,7 +1924,7 @@ impl<T: Hash> Hash for EnhVec<T> {
     */
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let (sum, xor): (u64, u64) = fold_digests(self.data.internal_iter().map(hash_item));
+        let (sum, xor): (u64, u64) = fold_digests(self.data.internal_iter().map(elem_digest));
         state.write_usize(self.len());
         state.write_u64(sum);
         state.write_u64(xor);
@@ -2502,6 +2519,20 @@ fn fold_digests(digests: impl Iterator<Item = u64>) -> (u64, u64) {
     digests.fold((0, 0), |(sum, xor): (u64, u64), digest: u64| {
         (sum.wrapping_add(digest), xor ^ digest)
     })
+}
+
+/// The digest of an element in `Hash` for [EnhVec], with xxh3.
+#[cfg(not(feature = "std-hasher"))]
+#[inline]
+fn elem_digest<T: Hash>(item: &T) -> u64 {
+    hash_item(item)
+}
+
+/// The digest of an element in `Hash` for [EnhVec], with SipHash and the process' keys.
+#[cfg(feature = "std-hasher")]
+#[inline]
+fn elem_digest<T: Hash>(item: &T) -> u64 {
+    DIGEST_KEYS.hash_one(item)
 }
 
 /// Sort a vector in place, based on the current and desired sorting state.

@@ -28,6 +28,16 @@ its tag:
 enhvec = { git = "https://github.com/Ukko-Ylijumala/enhvec-rs", tag = "v0.5.0" }
 ```
 
+### Crate Features
+
+- `std-hasher`: hash with std's SipHash and random keys instead of xxh3 where the crate picks the
+  hasher, for resistance to collisions crafted by an attacker (see Hashing below)
+
+```toml
+[dependencies]
+enhvec = { git = "https://github.com/Ukko-Ylijumala/enhvec-rs", features = ["std-hasher"] }
+```
+
 ## Basic Usage
 
 ```rust
@@ -160,9 +170,14 @@ the elements can search for colliding sets offline. Keep that in mind before usi
 untrusted data as `HashMap` keys.
 
 The maps and sets built by `mode()`, `distinct()` and `set_relation_hashed()` hash with xxh3 and a
-random seed per map (`RandomXxh3Builder` of `custom_xxh3`), ~2.5x faster than std's SipHash for
-integers. Their results do not depend on the hasher, but unlike SipHash, xxh3 is not designed to
-resist collisions crafted by an attacker, which slow down these methods.
+random seed per map (`RandomXxh3Builder` of `custom_xxh3`), up to ~2.5x faster than std's SipHash
+for integers. Their results do not depend on the hasher, but unlike SipHash, xxh3 is not designed
+to resist collisions crafted by an attacker, which slow down these methods.
+
+For untrusted data, the `std-hasher` feature hashes both with std's SipHash and random keys instead:
+the maps with keys per map like std's `HashMap`, and the element digests of `Hash` with keys drawn
+once per process. `Hash` is then ~6x slower for integers and ~2x for short strings, and the three
+methods ~1.3x slower. `Xxh3Hashable` always hashes with xxh3, as its digests are meant to be stable.
 
 ## Performance
 
@@ -209,6 +224,9 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
+- 0.6.5: `std-hasher` feature
+    - Hashes with std's SipHash and random keys instead of xxh3 in `Hash` and in `mode()`, `distinct()` and
+      `set_relation_hashed()`, for untrusted data. Off by default
 - 0.6.4: Faster hashing in `mode()`, `distinct()` and `set_relation_hashed()`
     - Their maps and sets hash with xxh3 and a random seed per map instead of std's SipHash: up to ~2.5x faster
       for integers, ~1.1-1.8x for strings, same results. Needs `custom_xxh3` 0.4.1 or later to be fast
