@@ -1,6 +1,6 @@
 // Copyright (c) 2024-2026 Mikko Tanner. All rights reserved.
 
-use custom_xxh3::{hash_item, QuickXxh3Hasher, Xxh3Hashable};
+use custom_xxh3::{hash_item, QuickXxh3Hasher, RandomXxh3Builder, Xxh3Hashable};
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -25,6 +25,14 @@ const GROW_8X: usize = 128 * 1024;
 const GROW_4X: usize = 4 * 1024 * 1024;
 /// Number of independent partial sums in `lane_sum()`.
 const SUM_LANES: usize = 8;
+
+/**
+The hasher of the maps and sets built in `mode()`, `distinct()` and
+`set_relation_hashed()`. Their results do not depend on it, and xxh3 with
+a random seed per map is ~2.5x faster than std's SipHash for integers,
+though not designed to resist collisions crafted by an attacker.
+*/
+type ElemHasher = RandomXxh3Builder;
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 /// The expected sorting state of an [EnhVec].
@@ -1535,17 +1543,30 @@ impl SetRelation {
 impl<T: Eq + Hash> EnhVec<T> {
     /**
     How this and another [EnhVec] relate as sets, see [SetRelation].
-    Time complexity: expected `O(N + M)`, plus building a [HashSet] of each.
+    Time complexity: expected `O(N + M)`, plus building a [HashMap] of the
+    shorter one, in which the elements of the other one are looked up.
     */
     pub fn set_relation_hashed(&self, other: &Self) -> SetRelation {
-        let left: HashSet<&T> = self.data.internal_iter().collect();
-        let right: HashSet<&T> = other.data.internal_iter().collect();
-        let shared: usize = left.iter().filter(|&x| right.contains(x)).count();
-        SetRelation {
-            shared: shared > 0,
-            left_only: shared < left.len(),
-            right_only: shared < right.len(),
+        let swap: bool = other.len() < self.len();
+        let (short, long): (&Self, &Self) = if swap { (other, self) } else { (self, other) };
+
+        // whether each element of the shorter one is found in the longer one
+        let mut found: HashMap<&T, bool, ElemHasher> =
+            short.data.internal_iter().map(|x: &T| (x, false)).collect();
+        let (mut shared, mut long_only): (bool, bool) = (false, false);
+        for x in long.data.internal_iter() {
+            match found.get_mut(x) {
+                Some(hit) => (*hit, shared) = (true, true),
+                None => long_only = true,
+            }
         }
+        let short_only: bool = found.values().any(|&hit: &bool| !hit);
+
+        let (left_only, right_only): (bool, bool) = match swap {
+            true => (long_only, short_only),
+            false => (short_only, long_only),
+        };
+        SetRelation { shared, left_only, right_only }
     }
 }
 
@@ -1903,14 +1924,14 @@ impl<T: Xxh3Hashable> Xxh3Hashable for EnhVec<T> {
     its `xxh3_digest()` is the digest of each element.
 
     The values are hashed as little-endian `u64`s, to keep the result the
-    same across platforms.
+    same across platforms. They go in one write, which a hasher takes in
+    quicker than three, with the same result for xxh3.
     */
     #[inline]
     fn xxh3<H: Hasher>(&self, state: &mut H) {
         let (sum, xor): (u64, u64) = fold_digests(self.data.internal_iter().map(T::xxh3_digest));
-        state.write(&(self.len() as u64).to_le_bytes());
-        state.write(&sum.to_le_bytes());
-        state.write(&xor.to_le_bytes());
+        let words: [[u8; 8]; 3] = [self.len() as u64, sum, xor].map(u64::to_le_bytes);
+        state.write(words.as_flattened());
     }
 
     /**
@@ -1950,7 +1971,7 @@ impl<T: Copy + Eq + Hash> EnhVec<T> {
             return longest.map(|run: &[T]| run[0]);
         }
 
-        let mut counts: HashMap<T, usize> = HashMap::new();
+        let mut counts: HashMap<T, usize, ElemHasher> = HashMap::default();
         for &item in self.data.internal_iter() {
             *counts.entry(item).or_insert(0) += 1;
         }
@@ -1977,7 +1998,7 @@ impl<T: Copy + Eq + Hash> EnhVec<T> {
             unique.dedup();
             unique
         } else {
-            let mut seen: HashSet<T> = HashSet::new();
+            let mut seen: HashSet<T, ElemHasher> = HashSet::default();
             let elements = self.data.internal_iter().copied();
             elements.filter(|&x| seen.insert(x)).collect()
         };
@@ -3754,6 +3775,9 @@ mod tests {
         let mut hasher: CustomXxh3Hasher = CustomXxh3Hasher::default();
         xxh_asc.xxh3(&mut hasher);
         assert_eq!(hasher.finish(), xxh_asc.xxh3_digest(), "xxh3_digest() == xxh3() + finish()");
+        // stable digests, which must not change unnoticed
+        assert_eq!(xxh_asc.xxh3_digest(), 0xa262_14e0_72c3_cba5, "stable xxh3 digest");
+        assert_eq!(xxh3_vec(&[]).xxh3_digest(), 0xaba6_d5cb_d60a_77f5, "stable xxh3 digest, empty");
 
         let digest = |a: &[u32], b: &[u32]| {
             let mut hasher: CustomXxh3Hasher = CustomXxh3Hasher::default();

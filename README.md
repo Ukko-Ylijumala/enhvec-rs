@@ -159,6 +159,11 @@ The element digests do not use the random keys of the hasher given to `Hash`, so
 the elements can search for colliding sets offline. Keep that in mind before using EnhVecs of
 untrusted data as `HashMap` keys.
 
+The maps and sets built by `mode()`, `distinct()` and `set_relation_hashed()` hash with xxh3 and a
+random seed per map (`RandomXxh3Builder` of `custom_xxh3`), ~2.5x faster than std's SipHash for
+integers. Their results do not depend on the hasher, but unlike SipHash, xxh3 is not designed to
+resist collisions crafted by an attacker, which slow down these methods.
+
 ## Performance
 
 `EnhVec` keeps its elements in order in one buffer, with free space before and after them, so it
@@ -204,6 +209,12 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
+- 0.6.4: Faster hashing in `mode()`, `distinct()` and `set_relation_hashed()`
+    - Their maps and sets hash with xxh3 and a random seed per map instead of std's SipHash: up to ~2.5x faster
+      for integers, ~1.1-1.8x for strings, same results. Needs `custom_xxh3` 0.4.1 or later to be fast
+      (`cargo update -p custom_xxh3`)
+    - `set_relation_hashed()` builds one map, of the shorter one, instead of a set of each: up to ~1.7x faster still
+    - `xxh3()` writes its values to the hasher at once, same digests
 - 0.6.3: Capacity control, `extend_from_slice()`
     - `capacity()`, `reserve()`, `reserve_front()`, `shrink_to_fit()`, and `extend_from_slice()` as fast as `Vec`'s
 - 0.6.2: Vec methods that keep a known order
